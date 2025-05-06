@@ -1,0 +1,18 @@
+item_page:
+  title: "head > meta[name='DC.title']"
+  authors: "head > meta[name='DC.creator']"
+  publication_date: "head > meta[name='DCTERMS.issued']"
+  abstract: "head > meta[name='DCTERMS.abstract']"
+  keywords: "head > meta[name='DC.subject']"
+  handle_uri: "head > meta[name='DC.identifier'][scheme='DCTERMS.URI']"
+  # Corregido: Usar XPath para encontrar el enlace de descarga principal
+  pdf_link_xpath: "//a[contains(@href, '/bitstream/handle/') and contains(translate(text(), 'DESCARGAR', 'descargar'), 'descargar')]"
+  # Mantenemos el selector CSS original como fallback si es necesario, pero lo comentamos
+  # pdf_link: "div.item-page-field-wrapper table tr td a[href*='/bitstream/']"
+  # Agregaremos más si es necesario al implementar el scraper 
+
+search_page:
+  results_container_selector: "#aspect_discovery_SimpleSearch_div_search-results" # CSS selector
+  item_link_selector: "//a[.//h4]"     # XPath selector
+  # Actualizar selector para encontrar el link 'Siguiente' (probablemente el último <a> en el último <li>)
+  next_page_link_selector: "//ul[contains(@class,'pagination')]/li[last()]/a" # XPath selector
