@@ -81,31 +81,40 @@ Sigue estos pasos desde la raíz del proyecto (`web-scraping/`):
 
 ## 4. Estructura de Carpetas y Archivos Relevantes
 
-El scraper opera principalmente dentro del directorio `AR/` y genera la siguiente estructura:
+El scraper opera principalmente dentro del directorio `AR/`. Durante su ejecución, genera archivos en `AR/db/`, `AR/logs/` y `AR/output/`. Al finalizar, crea un paquete consolidado en `AR/output_package/`.
 
+**Directorios de Trabajo (dentro de `AR/`):**
 ```
 AR/
 ├── db/
 │   └── scraper.db             # Base de datos SQLite con el estado y metadatos.
-├── docs/
-│   └── sample_pdfs/           # Directorio para PDFs de muestra (según config).
 ├── logs/
 │   └── AR-SCRAPER.log         # Log detallado de la ejecución.
-├── output/
+├── output/                     # Directorio de trabajo durante la ejecución
 │   ├── html_snapshot/         # Snapshots HTML de las páginas de ítems.
 │   │   └── <item_id>/
 │   │       └── <nombre_snapshot>.html
-│   │
 │   ├── pdf/                   # PDFs descargados.
 │   │   └── <item_id>/
 │   │       └── <nombre_pdf>.pdf
-│   │
 │   ├── state.json             # Resumen del estado de todos los ítems procesados.
 │   └── test_results.json      # Resultados de verificación para una muestra de PDFs.
 ├── README.md                  # Este archivo.
-├── requirements.txt           # Dependencias Python (debe ser creado/actualizado).
+├── requirements.txt           # Dependencias Python.
 ├── scraper.py                 # El script principal del scraper.
 └── selectors.yaml             # Selectores XPath para la extracción de datos HTML.
+```
+
+**Paquete de Salida Final (generado en `AR/output_package/`):**
+```
+AR/output_package/
+├── scraper.py                 # El script ejecutable.
+├── selectors.yaml             # Archivo de selectores.
+├── README.md                  # Una copia de este README.
+├── test_results.json          # Resultados de verificación para una muestra de PDFs.
+└── docs/
+    └── sample_pdfs/
+        └── (hasta 5 PDFs de muestra de los descargados)
 ```
 
 ### Ejemplos de Archivos de Salida
@@ -148,8 +157,8 @@ AR/
 
 ## 5. Próximos Pasos y Mejoras Potenciales
 
-*   Crear/actualizar `AR/requirements.txt` de forma más robusta.
-*   Mejorar la configuración para que sea más externa (ej. un solo archivo de configuración principal).
-*   Implementar la copia de PDFs de muestra a `AR/docs/sample_pdfs/` si es un requisito estricto para el empaquetado.
-*   Refinar selectores en `selectors.yaml` para mayor precisión.
-*   Añadir más opciones de filtrado para `get_items_to_process`.
+*   Crear/actualizar `AR/requirements.txt` de forma más robusta (ej. `pip freeze > AR/requirements.txt`).
+*   Mejorar la configuración para que sea más externa (ej. un solo archivo de configuración principal JSON o YAML que englobe `DEFAULT_CONFIG` y `selectors.yaml`).
+*   Refinar selectores en `selectors.yaml` para mayor precisión si se encuentran repositorios con estructuras HTML diferentes.
+*   Añadir más opciones de filtrado o procesamiento para `get_items_to_process`.
+*   Considerar la gestión de diferentes `User-Agent` si se detectan bloqueos.
