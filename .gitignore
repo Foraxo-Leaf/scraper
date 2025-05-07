@@ -40,12 +40,19 @@ venv.bak/
 *.sublime-workspace
 
 # Archivos y directorios específicos del proyecto
-# (ejemplos, ajustar según necesidad)
 *.log
 *.sqlite3
-*.db # Para la base de datos del scraper si se usa ese nombre genérico
+*.db
+state.json
+registry.jsonl
+strategy_log.jsonl
+validate.json
+analysis.json
+test_results.json
+# Agrega aquí cualquier otro archivo o carpeta que no deba ser versionado
 
-# Ignorar directorios y archivos generados dentro de AR/
+# ---- REGLAS ESPECÍFICAS PARA AR ----
+# Dentro de AR/, ignorar subdirectorios de datos/logs/salidas
 AR/db/
 AR/logs/
 AR/output/
@@ -54,16 +61,38 @@ AR/docs/sample_pdfs/
 AR/output/state.json
 AR/output/test_results.json
 
-# Si tienes otros directorios de países (BO, CL, etc.) y generan salidas similares,
-# puedes añadir reglas para ellos también, o usar patrones más genéricos si aplica.
-# Ejemplo para ignorar carpetas 'output' en cualquier subdirectorio de un país:
-# **/output/
-# Sin embargo, ser específico como arriba para AR/ es más seguro.
+# ---- IGNORAR OTROS DIRECTORIOS PRINCIPALES Y ARCHIVOS ESPECÍFICOS ----
+# Ignorar todos los directorios en la raíz EXCEPTO AR/
+<CODE>/*
+AR-viejo/*
+BO/*
+BR/*
+CL/*
+CO/*
+CR/*
+DO/*
+EC/*
+ES/*
+HN/*
+NI/*
+PA/*
+PY/*
 
-# Ignorar otros archivos específicos del proyecto que no deben ser versionados
-# <CODE>/ # Si esta carpeta es generada y no debe subirse
-# analysis.json # Si es un archivo temporal
-# ... etc.
+# Ignorar directorio 'scraper/' si es un directorio aparte a nivel raíz
+# Si AR/ es tu directorio principal de scraping, y no hay otro llamado 'scraper/', puedes comentar o eliminar la siguiente línea.
+scraper/
 
-# Ignorar directorio 'scraper' si ya no es relevante o es un submodulo no gestionado
-scraper/ 
+# Ignorar archivos comunes sin seguimiento en la raíz
+.cursor/
+# analysis.json # Ya está cubierto arriba
+analyze_results.py
+/db/ # Directorio db/ en la raíz (si es distinto de AR/db/)
+embrapa_scraper_prompt.md
+/output/ # Directorio output/ en la raíz (si es distinto de AR/output/)
+# registry.jsonl # Ya está cubierto arriba
+task_dashboard.html
+tasks-slack.json
+tasks.json
+
+# NO IGNORAR (Importante para la reproducibilidad)
+# requirements.txt

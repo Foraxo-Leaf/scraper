@@ -1542,48 +1542,32 @@ class Scraper:
             # 3. Copiar PDFs de muestra
             conn = self.db_manager._connect()
             cursor = conn.cursor()
-            # Obtener item_id y remote_url para reconstruir la ruta actual
             sql_query = """ 
-                SELECT item_id, remote_url 
+                SELECT local_path 
                 FROM files 
                 WHERE file_type = ? AND (download_status = ? OR download_status = ?)
                 ORDER BY download_timestamp DESC 
                 LIMIT ? 
             """
             cursor.execute(sql_query, ('pdf', 'downloaded', 'skipped_exists', max_sample_pdfs))
-            pdf_records = cursor.fetchall()
+            pdf_file_paths = [row['local_path'] for row in cursor.fetchall()]
             conn.close()
 
             copied_pdf_count = 0
-            output_pdf_dir = os.path.join(self.config['output_dir'], 'pdf') # Directorio actual de PDFs
-
-            for record in pdf_records:
-                item_id = record['item_id']
-                remote_url = record['remote_url']
-                
-                # Reconstruir nombre de archivo seguro (lógica simplificada de _build_local_path)
-                try:
-                    url_path = urlparse(remote_url).path
-                    filename_base = os.path.basename(url_path).split('?')[0]
-                    safe_filename = "".join([c for c in filename_base if c.isalnum() or c in ('-', '_', '-')]).rstrip()
-                    if not safe_filename: safe_filename = f"file_{hashlib.md5(remote_url.encode()).hexdigest()[:8]}"
-                    if not safe_filename.lower().endswith('.pdf'): safe_filename += ".pdf"
-                except Exception:
-                    safe_filename = f"file_{hashlib.md5(remote_url.encode()).hexdigest()[:8]}.pdf" # Fallback
-                
-                # Construir ruta actual esperada
-                current_pdf_path = os.path.join(output_pdf_dir, str(item_id), safe_filename)
-
-                if os.path.exists(current_pdf_path):
+            for pdf_path in pdf_file_paths:
+                if pdf_path and os.path.exists(pdf_path):
                     try:
-                        dest_path = os.path.join(sample_pdfs_dir, safe_filename) # Copiar solo el archivo
-                        shutil.copy2(current_pdf_path, dest_path)
-                        logging.info(f"PDF de muestra copiado: {current_pdf_path} -> {dest_path}")
+                        # Usar solo el nombre del archivo para el destino para evitar rutas anidadas innecesarias
+                        dest_pdf_name = os.path.basename(pdf_path)
+                        dest_path = os.path.join(sample_pdfs_dir, dest_pdf_name)
+                        shutil.copy2(pdf_path, dest_path)
+                        logging.info(f"PDF de muestra copiado: {pdf_path} -> {dest_path}")
                         copied_pdf_count += 1
                     except Exception as e_pdf:
-                        logging.error(f"Error copiando PDF de muestra {current_pdf_path}: {e_pdf}")
-                else:
-                    logging.warning(f"PDF de muestra no encontrado en la ruta actual esperada: {current_pdf_path} (La ruta en BD podría ser obsoleta)")
+                        logging.error(f"Error copiando PDF de muestra {pdf_path}: {e_pdf}")
+                elif pdf_path: # Si pdf_path tiene valor pero no existe el archivo
+                    logging.warning(f"PDF de muestra no encontrado en la ruta (podría ser None o la ruta no existe): {pdf_path}")
+                # Si pdf_path es None, no logueamos nada extra, ya que get_items_to_process podría no devolverlo.
             
             logging.info(f"{copied_pdf_count} PDFs de muestra copiados a {sample_pdfs_dir}")
             logging.info(f"Paquete de salida generado exitosamente en {base_package_dir}")
