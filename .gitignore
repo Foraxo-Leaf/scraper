@@ -24,7 +24,7 @@ MANIFEST
 
 # Virtual environment
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -39,17 +39,31 @@ venv.bak/
 *.sublime-project
 *.sublime-workspace
 
-# Project specific (based on rules)
-/logs/
-/docs/
-/output_package/
-*.json
-*.jsonl
+# Archivos y directorios específicos del proyecto
+# (ejemplos, ajustar según necesidad)
 *.log
-state.json
-registry.jsonl
-strategy_log.jsonl
-validate.json
-analysis.json
-test_results.json
-# Agrega aquí cualquier otro archivo o carpeta que no deba ser versionado 
+*.sqlite3
+*.db # Para la base de datos del scraper si se usa ese nombre genérico
+
+# Ignorar directorios y archivos generados dentro de AR/
+AR/db/
+AR/logs/
+AR/output/
+AR/output_package/
+AR/docs/sample_pdfs/
+AR/output/state.json
+AR/output/test_results.json
+
+# Si tienes otros directorios de países (BO, CL, etc.) y generan salidas similares,
+# puedes añadir reglas para ellos también, o usar patrones más genéricos si aplica.
+# Ejemplo para ignorar carpetas 'output' en cualquier subdirectorio de un país:
+# **/output/
+# Sin embargo, ser específico como arriba para AR/ es más seguro.
+
+# Ignorar otros archivos específicos del proyecto que no deben ser versionados
+# <CODE>/ # Si esta carpeta es generada y no debe subirse
+# analysis.json # Si es un archivo temporal
+# ... etc.
+
+# Ignorar directorio 'scraper' si ya no es relevante o es un submodulo no gestionado
+scraper/ 
