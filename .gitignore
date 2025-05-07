@@ -53,3 +53,12 @@ validate.json
 analysis.json
 test_results.json
 # Agrega aquí cualquier otro archivo o carpeta que no deba ser versionado 
+
+# Ignorar directorios y archivos generados dentro de AR/
+AR/db/
+AR/logs/
+AR/output/
+AR/output_package/
+AR/docs/sample_pdfs/
+AR/output/state.json
+AR/output/test_results.json 

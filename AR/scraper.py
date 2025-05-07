@@ -1,4 +1,3 @@
-
 import requests
 import xml.etree.ElementTree as ET
 import yaml
@@ -20,17 +19,17 @@ DEFAULT_CONFIG = {
     "country_code": "AR",
     "oai_endpoint": "https://repositorio.inta.gob.ar/oai/request",
     "metadata_prefix": "oai_dc",
-    "selectors_file": "AR/selectors.yaml",
-    "output_dir": "AR/output",
-    "pdf_dir": "AR/docs/sample_pdfs/",
-    "metadata_file": "AR/output/metadata.jsonl",
-    "log_file": "AR/logs/AR-SCRAPER.log",
-    "db_file": "AR/db/scraper.db",
+    "selectors_file": "selectors.yaml", # Relativo al script
+    "output_dir": "output", # Relativo al script, se resolverá en __init__
+    "pdf_dir": "docs/sample_pdfs/", # Relativo al script, se resolverá en __init__ (para empaquetado)
+    "metadata_file": "output/metadata.jsonl", # Relativo al script, se resolverá en __init__
+    "log_file": "logs/AR-SCRAPER.log", # Relativo al script, se resolverá en __init__
+    "db_file": "db/scraper.db", # Relativo al script, se resolverá en __init__
 
     # --- Configuración específica para el modo de ejecución ---
     "mode": "keyword_search",  # Cambiado de 'oai' a 'keyword_search'
-    "keywords": ["suelo", "agua"], # Palabras clave de ejemplo
-    "max_search_pages": 2, # Limitar a 2 páginas por keyword para la prueba
+    "keywords": ["semilla"], # Cambiado para la prueba
+    "max_search_pages": 1, # Limitado para la prueba
     "rpp": 10, # Resultados por página (DSpace default suele ser 10 o 20)
 
     # --- Configuración general del scraper ---
@@ -105,10 +104,10 @@ def setup_directories(output_dir, pdf_dir):
     """Crea los directorios de salida necesarios."""
     try:
         if output_dir: # Asegurar que output_dir no sea None tampoco
-        os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
         # Solo intentar crear pdf_dir si NO es None
         if pdf_dir:
-        os.makedirs(pdf_dir, exist_ok=True)
+            os.makedirs(pdf_dir, exist_ok=True)
     except OSError as e:
         logging.error(f"Error creando directorios de salida: {e}")
         raise
@@ -413,7 +412,7 @@ class HTMLMetadataExtractor:
                 if html_local_path:
                      metadata['html_local_path'] = html_local_path # Añadir ruta al diccionario
 
-            return item_page_url, metadata
+                return item_page_url, metadata # Esta línea debe estar indentada
             else:
                 logging.error(f"[{log_id} / Item {item_id}] Contenido HTML vacío o no decodificable para {item_page_url}")
                 return item_page_url, None
@@ -1095,6 +1094,17 @@ class Scraper:
         self.config = config # Guardar config completa
         self.selectors = {}
 
+        # --- Construir rutas absolutas basadas en la ubicación del script ---
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config['script_dir'] = script_dir # Guardar para referencia, ej. en _package_output
+
+        # Lista de claves de configuración que representan rutas a resolver
+        path_keys = ['selectors_file', 'output_dir', 'pdf_dir', 'metadata_file', 'log_file', 'db_file']
+        for key in path_keys:
+            if key in self.config:
+                self.config[key] = os.path.join(script_dir, self.config[key])
+        # --- Fin de construcción de rutas absolutas ---
+
         setup_logging(self.config['log_file'])
 
         try:
@@ -1150,7 +1160,17 @@ class Scraper:
     def _load_selectors(self):
         """Carga los selectores desde el archivo YAML."""
         try:
-            with open(self.config['selectors_file'], 'r', encoding='utf-8') as f:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            selectors_file_name = self.config['selectors_file'] # Ahora solo el nombre del archivo, ej: "selectors.yaml"
+            full_selectors_path = os.path.join(script_dir, selectors_file_name)
+
+            logging.info(f"Directorio del script: {script_dir}")
+            logging.info(f"Nombre del archivo de selectores configurado: {selectors_file_name}")
+            logging.info(f"Intentando cargar selectores desde la ruta absoluta: {full_selectors_path}")
+            logging.info(f"Verificando existencia (os.path.exists): {os.path.exists(full_selectors_path)}")
+            logging.info(f"Verificando si es archivo (os.path.isfile): {os.path.isfile(full_selectors_path)}")
+
+            with open(full_selectors_path, 'r', encoding='utf-8') as f:
                 self.selectors = yaml.safe_load(f)
             if not self.selectors:
                  logging.warning(f"Archivo de selectores {self.config['selectors_file']} está vacío o no es válido.")
@@ -1189,21 +1209,21 @@ class Scraper:
         if mode == 'oai':
             discovery_mode = 'oai'
             identifiers = self.harvester.get_identifiers(max_records=max_oai_records)
-        if not identifiers:
-                    logging.info("Modo OAI: No se obtuvieron identificadores OAI.")
+            if not identifiers:
+                        logging.info("Modo OAI: No se obtuvieron identificadores OAI.")
             else:
-                    logging.info(f"Modo OAI: {len(identifiers)} identificadores obtenidos. Registrando/verificando en BD...")
-                    for oai_id in identifiers:
-                        item_page_url = self.extractor._get_item_page_url(oai_id)
-                        if item_page_url:
-                            item_id, _ = self.db_manager.get_or_create_item_by_url(
-                                item_page_url=item_page_url,
-                                processing_status="pending_download",
-                                discovery_mode="oai",
-                                oai_identifier=oai_id
-                            )
-                            if item_id: items_discovered_this_run += 1 # Contar nuevos/existentes verificados
-                    logging.info(f"Modo OAI: {items_discovered_this_run} ítems registrados/verificados en BD.")
+                        logging.info(f"Modo OAI: {len(identifiers)} identificadores obtenidos. Registrando/verificando en BD...")
+                        for oai_id in identifiers:
+                            item_page_url = self.extractor._get_item_page_url(oai_id)
+                            if item_page_url:
+                                item_id, _ = self.db_manager.get_or_create_item_by_url(
+                                    item_page_url=item_page_url,
+                                    processing_status="pending_download",
+                                    discovery_mode="oai",
+                                    oai_identifier=oai_id
+                                )
+                                if item_id: items_discovered_this_run += 1 # Contar nuevos/existentes verificados
+                        logging.info(f"Modo OAI: {items_discovered_this_run} ítems registrados/verificados en BD.")
 
         elif mode == 'keyword_search':
             discovery_mode = 'keyword_search'
@@ -1475,9 +1495,13 @@ class Scraper:
 
     def _package_output(self, max_sample_pdfs=5):
         """Crea el paquete de salida en AR/output_package/."""
-        logging.info("Generando paquete de salida en AR/output_package/...")
         
-        base_package_dir = "AR/output_package"
+        script_dir = self.config.get('script_dir', os.path.dirname(os.path.abspath(__file__)))
+        # base_package_dir ahora se construye relativo al script_dir
+        base_package_dir = os.path.join(script_dir, "output_package")
+
+        logging.info(f"Generando paquete de salida en {base_package_dir}...")
+        
         docs_dir = os.path.join(base_package_dir, "docs")
         sample_pdfs_dir = os.path.join(docs_dir, "sample_pdfs")
 
@@ -1487,15 +1511,14 @@ class Scraper:
             logging.info(f"Directorio del paquete creado/verificado: {base_package_dir}")
 
             # 2. Definir archivos a copiar y sus destinos
-            # Usar self.config para obtener rutas de origen si es posible, o rutas relativas al script
-            # Asumimos que scraper.py está en el directorio AR/
-            script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else "AR" 
-            output_dir_config = self.config.get('output_dir', 'AR/output')
+            # output_dir_config ya es una ruta absoluta desde __init__
+            output_dir_config = self.config.get('output_dir') 
 
             files_to_copy = [
                 (os.path.join(script_dir, "scraper.py"), os.path.join(base_package_dir, "scraper.py")),
                 (os.path.join(script_dir, "selectors.yaml"), os.path.join(base_package_dir, "selectors.yaml")),
                 (os.path.join(script_dir, "README.md"), os.path.join(base_package_dir, "README.md")),
+                # test_results.json está en el output_dir_config que ya es absoluto
                 (os.path.join(output_dir_config, "test_results.json"), os.path.join(base_package_dir, "test_results.json"))
             ]
 
