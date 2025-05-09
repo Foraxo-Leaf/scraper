@@ -1,1 +1,524 @@
-import sqlite3\nimport os\nimport logging\nimport json # Para serializar/deserializar metadatos complejos si es necesario\nfrom datetime import datetime\n\nclass DatabaseManagerBR:\n    \"\"\"\n    Gestiona la base de datos SQLite para el scraper de Brasil (BR).\n    Almacena información sobre ítems, archivos descargados, metadatos y estado del procesamiento.\n    \"\"\"\n\n    def __init__(self, db_file_path, logger=None):\n        \"\"\"\n        Inicializa el DatabaseManagerBR.\n\n        Args:\n            db_file_path (str): Ruta al archivo de la base de datos SQLite.\n            logger (logging.Logger, optional): Instancia del logger. \n                                               Si es None, se crea un logger básico.\n        \"\"\"\n        self.db_file_path = db_file_path\n        self.logger = logger if logger else logging.getLogger(__name__)\n        self._ensure_db_directory()\n        self.conn = None\n        # Llamar a init_db para asegurar que la conexión y las tablas se creen si no existen.\n        # La conexión se establecerá dentro de init_db o connect.\n        self.init_db()\n\n    def _ensure_db_directory(self):\n        \"\"\"Asegura que el directorio de la base de datos exista.\"\"\"\n        db_dir = os.path.dirname(self.db_file_path)\n        if db_dir and not os.path.exists(db_dir):\n            try:\n                os.makedirs(db_dir)\n                self.logger.info(f\"Directorio de base de datos creado: {db_dir}\")\n            except OSError as e:\n                self.logger.error(f\"Error creando directorio de base de datos {db_dir}: {e}\")\n                raise\n\n    def connect(self):\n        \"\"\"Establece la conexión con la base de datos SQLite.\"\"\"\n        if self.conn is None:\n            try:\n                # isolation_level=None para autocommit (útil para algunas operaciones simples,\n                # pero para transacciones complejas, es mejor manejar commits explícitamente)\n                # Por ahora, lo dejamos por defecto (BEGIN en DML) y haremos commit explícito.\n                self.conn = sqlite3.connect(self.db_file_path, timeout=10) # Timeout de 10s\n                self.conn.row_factory = sqlite3.Row # Acceder a columnas por nombre\n                self.logger.info(f\"Conexión establecida con la base de datos: {self.db_file_path}\")\n            except sqlite3.Error as e:\n                self.logger.error(f\"Error conectando a la base de datos {self.db_file_path}: {e}\")\n                raise\n        return self.conn\n\n    def close(self):\n        \"\"\"Cierra la conexión con la base de datos.\"\"\"\n        if self.conn:\n            try:\n                self.conn.close()\n                self.conn = None\n                self.logger.info(\"Conexión con la base de datos cerrada.\")\n            except sqlite3.Error as e:\n                self.logger.error(f\"Error cerrando la conexión con la base de datos: {e}\")\n\n    def init_db(self):\n        \"\"\"\n        Inicializa la base de datos creando las tablas necesarias si no existen.\n        \"\"\"\ grievous_bodily_harm_ENSURE_DB_CONNECTION\n        if not self.conn:\n            self.connect()\n        \n        try:\n            cursor = self.conn.cursor()\n            # Tabla de ítems (publicaciones, documentos, etc.)\n            cursor.execute(\"\"\"\n            CREATE TABLE IF NOT EXISTS items (\n                item_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                item_page_url TEXT UNIQUE,         -- URL de la página del ítem (si existe y es única)\n                oai_identifier TEXT,             -- Identificador OAI-PMH (puede ser único por repositorio)\n                repository_source TEXT NOT NULL, -- Nombre/URL del repositorio fuente (OAI, web)\n                processing_status TEXT NOT NULL DEFAULT \'pending\', -- pending, oai_harvested, pending_html_processing, pending_pdf_link, pending_pdf_download, processed, failed, deleted\n                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n                notes TEXT,                      -- Notas adicionales sobre el ítem\n                UNIQUE (oai_identifier, repository_source) -- Un OAI ID es único por su fuente OAI\n            )\n            \"\"\")\n            self.logger.debug(\"Tabla \'items\' verificada/creada.\")\n\n            # Tabla de metadatos (permite múltiples valores por ítem y campo)\n            cursor.execute(\"\"\"\n            CREATE TABLE IF NOT EXISTS metadata (\n                metadata_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                item_id INTEGER NOT NULL,\n                field_name TEXT NOT NULL,          -- ej. title, author, dc:creator, dc:date\n                field_value TEXT NOT NULL,\n                source_type TEXT,                -- ej. oai, html_meta_tag, html_content, manual\n                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n                FOREIGN KEY (item_id) REFERENCES items (item_id) ON DELETE CASCADE\n            )\n            \"\"\")\n            self.logger.debug(\"Tabla \'metadata\' verificada/creada.\")\n\n            # Tabla de archivos (PDFs, HTML snapshots, etc.)\n            cursor.execute(\"\"\"\n            CREATE TABLE IF NOT EXISTS files (\n                file_id INTEGER PRIMARY KEY AUTOINCREMENT,\n                item_id INTEGER NOT NULL,\n                file_type TEXT NOT NULL,           -- ej. pdf, html_snapshot, thumbnail\n                file_url TEXT NOT NULL,            -- URL original del archivo\n                local_path TEXT UNIQUE,            -- Ruta local donde se guardó el archivo (debería ser única)\n                download_status TEXT NOT NULL DEFAULT \'pending\', -- pending, downloaded, verified, failed_download, not_found\n                md5_hash TEXT,\n                file_size_bytes INTEGER,\n                download_attempts INTEGER DEFAULT 0,\n                last_download_attempt_at TIMESTAMP,\n                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n                FOREIGN KEY (item_id) REFERENCES items (item_id) ON DELETE CASCADE\n            )\n            \"\"\")\n            self.logger.debug(\"Tabla \'files\' verificada/creada.\")\n\n            # Índices para mejorar rendimiento de búsquedas comunes\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_items_oai_identifier ON items (oai_identifier)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_items_status ON items (processing_status)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_items_url ON items (item_page_url)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_metadata_item_id ON metadata (item_id)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_metadata_field ON metadata (item_id, field_name)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_files_item_id ON files (item_id)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_files_url ON files (file_url)\")\n            cursor.execute(\"CREATE INDEX IF NOT EXISTS idx_files_local_path ON files (local_path)\")\n            self.logger.debug(\"Índices verificados/creados.\")\n\n            self.conn.commit()\n            self.logger.info(\"Esquema de base de datos inicializado/verificado correctamente.\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error inicializando la base de datos: {e}\")\n            if self.conn: self.conn.rollback()\n            raise\n        finally:\n            if cursor : cursor.close()\n    \n    def _now_timestamp(self):\n        \"\"\"Retorna el timestamp actual en formato ISO para SQLite.\"\"\"\n        return datetime.utcnow().isoformat(sep=\' \', timespec=\'seconds\')\n\n    def get_or_create_item(self, oai_identifier=None, item_page_url=None, repository_source=None):\n        \"\"\"\n        Obtiene un ítem existente o crea uno nuevo si no se encuentra.\n        La unicidad se basa en (oai_identifier, repository_source) si oai_identifier está presente,\n        o en item_page_url si oai_identifier no está presente y item_page_url sí.\n\n        Args:\n            oai_identifier (str, optional): Identificador OAI del ítem.\n            item_page_url (str, optional): URL de la página del ítem.\n            repository_source (str): Nombre o identificador del repositorio fuente.\n\n        Returns:\n            tuple: (item_id, created_flag)\n                   item_id (int): El ID del ítem en la base de datos.\n                   created_flag (bool): True si el ítem fue creado, False si ya existía.\n        \n        Raises:\n            ValueError: Si no se provee ni oai_identifier ni item_page_url, o si falta repository_source.\n        \"\"\"\n        if not repository_source:\n            raise ValueError(\"repository_source es requerido para get_or_create_item.\")\n        if not oai_identifier and not item_page_url:\n            raise ValueError(\"Se debe proveer oai_identifier o item_page_url.\")\n\n        self.connect()\n        cursor = self.conn.cursor()\n        item_id = None\n        created = False\n        now = self._now_timestamp()\n\n        try:\n            if oai_identifier:\n                # Primero intentar buscar por OAI ID y fuente (más específico)\n                cursor.execute(\"SELECT item_id FROM items WHERE oai_identifier = ? AND repository_source = ?\", \n                               (oai_identifier, repository_source))\n                row = cursor.fetchone()\n                if row:\n                    item_id = row[\'item_id\']\n                    self.logger.debug(f\"Ítem existente encontrado por OAI ID: {oai_identifier}, Fuente: {repository_source}, item_id: {item_id}\")\n            \n            if item_id is None and item_page_url:\n                # Si no se encontró por OAI ID (o no se proveyó), buscar por URL de página\n                # Esta búsqueda es más genérica y podría colisionar si la misma URL es reportada por diferentes fuentes\n                # o si un ítem OAI también tiene una item_page_url. Por eso, priorizamos OAI ID.\n                cursor.execute(\"SELECT item_id FROM items WHERE item_page_url = ?\", (item_page_url,))\n                row = cursor.fetchone()\n                if row:\n                    item_id = row[\'item_id\']\n                    self.logger.debug(f\"Ítem existente encontrado por URL: {item_page_url}, item_id: {item_id}\")\n                    # Si encontramos por URL pero teníamos un OAI ID, actualizamos el OAI ID si no lo tenía\n                    if oai_identifier:\n                        cursor.execute(\"UPDATE items SET oai_identifier = ?, repository_source = ?, updated_at = ? WHERE item_id = ? AND (oai_identifier IS NULL OR repository_source != ?)\",\n                                       (oai_identifier, repository_source, now, item_id, repository_source))\n                        if cursor.rowcount > 0:\n                            self.logger.info(f\"Ítem {item_id} (encontrado por URL) actualizado con OAI ID: {oai_identifier} y fuente: {repository_source}\")\n            \n            if item_id is None: # Si aún no se encontró, crear nuevo ítem\n                self.logger.debug(f\"Creando nuevo ítem. OAI ID: {oai_identifier}, URL: {item_page_url}, Fuente: {repository_source}\")\n                # Determinar el estado inicial. Si tiene OAI ID, probablemente ya fue cosechado.\n                initial_status = \'pending\'\n                if oai_identifier:\n                    initial_status = \'pending_pdf_link\' # Asumimos que los metadatos OAI se loguearán después\n                elif item_page_url: # Si solo tenemos URL, necesita procesamiento HTML\n                    initial_status = \'pending_html_processing\'\n                \n                sql = \"INSERT INTO items (oai_identifier, item_page_url, repository_source, processing_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)\"\n                cursor.execute(sql, (oai_identifier, item_page_url, repository_source, initial_status, now, now))\n                item_id = cursor.lastrowid\n                created = True\n                self.conn.commit()\n                self.logger.info(f\"Nuevo ítem creado con ID: {item_id}, OAI ID: {oai_identifier}, URL: {item_page_url}, Fuente: {repository_source}\")\n            else: # Item ya existía\n                # Asegurar que updated_at se actualice si lo estamos tocando\n                # cursor.execute(\"UPDATE items SET updated_at = ? WHERE item_id = ?\", (now, item_id))\n                # self.conn.commit() # Esto podría ser demasiado frecuente, considerar cuándo es necesario\n                pass # No hacer nada más si el ítem ya existe, solo devolver su ID\n\n        except sqlite3.IntegrityError as e:\n            # Esto podría pasar si hay una condición de carrera o un caso no cubierto por las búsquedas de arriba\n            # Intentamos recuperar el ID del ítem que causó la violación de unicidad.\n            self.logger.warning(f\"Error de integridad al crear/obtener ítem (OAI: {oai_identifier}, URL: {item_page_url}, Src: {repository_source}): {e}. Intentando recuperar...\")\n            self.conn.rollback()\n            # Re-intentar la búsqueda explícitamente. Esto es un fallback.\n            if oai_identifier:\n                cursor.execute(\"SELECT item_id FROM items WHERE oai_identifier = ? AND repository_source = ?\", (oai_identifier, repository_source))\n                row = cursor.fetchone()\n                if row: item_id = row[\'item_id\']\n            if not item_id and item_page_url:\n                cursor.execute(\"SELECT item_id FROM items WHERE item_page_url = ?\", (item_page_url,))\n                row = cursor.fetchone()\n                if row: item_id = row[\'item_id\']\n            \n            if not item_id:\n                self.logger.error(f\"Fallo crítico al recuperar ítem después de IntegrityError para OAI: {oai_identifier}, URL: {item_page_url}, Src: {repository_source}\")\n                raise # Re-lanzar si no podemos recuperarlo\n            else:\n                 self.logger.info(f\"Ítem recuperado exitosamente después de IntegrityError, ID: {item_id}\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error de base de datos en get_or_create_item: {e}\")\n            if self.conn: self.conn.rollback()\n            raise\n        finally:\n            if cursor: cursor.close()\n        \n        if item_id is None:\n            # Esto no debería ocurrir si la lógica es correcta\n            self.logger.critical(f\"get_or_create_item está retornando item_id=None para OAI: {oai_identifier}, URL: {item_page_url}, Src: {repository_source}\")\n            # Forzar una excepción si esto pasa, ya que es un estado inválido.\n            raise Exception(f\"Fallo al obtener o crear item_id para OAI:{oai_identifier}, URL:{item_page_url}\")\n\n        return item_id, created\n\n    def update_item_status(self, item_id, status, notes=None):\n        \"\"\"Actualiza el estado de procesamiento y las notas de un ítem.\"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        now = self._now_timestamp()\n        try:\n            if notes:\n                cursor.execute(\"UPDATE items SET processing_status = ?, notes = ?, updated_at = ? WHERE item_id = ?\", \n                               (status, notes, now, item_id))\n            else:\n                cursor.execute(\"UPDATE items SET processing_status = ?, updated_at = ? WHERE item_id = ?\", \n                               (status, now, item_id))\n            self.conn.commit()\n            if cursor.rowcount > 0:\n                self.logger.info(f\"Estado del ítem {item_id} actualizado a \'{status}\'.\" + (f\" Notas: {notes}\" if notes else \"\"))\n            else:\n                self.logger.warning(f\"No se encontró el ítem {item_id} para actualizar estado a \'{status}\' o ya tenía ese estado.\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error actualizando estado del ítem {item_id}: {e}\")\n            if self.conn: self.conn.rollback()\n            # No relanzar para no detener el scraper por esto, pero loguear severamente.\n        finally:\n            if cursor: cursor.close()\n\n    def mark_oai_item_as_deleted(self, oai_identifier, repository_source):\n        \"\"\"Marca un ítem OAI como \'deleted\' en la base de datos.\"\"\"\n        try:\n            item_id, created = self.get_or_create_item(oai_identifier=oai_identifier, repository_source=repository_source)\n            if item_id:\n                self.update_item_status(item_id, \'deleted\', f\'Marcado como eliminado por OAI en {repository_source}\')\n                self.logger.info(f\"Ítem OAI {oai_identifier} de {repository_source} (ID: {item_id}) marcado como \'deleted\'.\")\n        except Exception as e:\n            self.logger.error(f\"Error marcando ítem OAI {oai_identifier} de {repository_source} como \'deleted\': {e}\")\n\n    def log_item_metadata(self, item_id, metadata_dict, source_type):\n        \"\"\"\n        Guarda múltiples campos de metadatos para un ítem.\n        Si un campo ya existe para ese item_id y source_type, podría ser duplicado o\n        requerir una lógica de actualización/borrado previo si no se quieren duplicados.\n        Por ahora, simplemente inserta (lo que puede llevar a duplicados si se llama múltiples veces\n        con los mismos datos, pero la tabla metadata permite esto para campos multivaluados).\n\n        Args:\n            item_id (int): ID del ítem.\n            metadata_dict (dict): Diccionario de metadatos {field_name: value or list_of_values}.\n            source_type (str): De dónde vienen estos metadatos (ej. oai, html_meta_tag).\n        \"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        now = self._now_timestamp()\n        try:\n            entries_to_insert = []\n            for field, values in metadata_dict.items():\n                if not isinstance(values, list):\n                    values = [values] # Convertir valor único a lista para manejo uniforme\n                for value in values:\n                    if value is not None: # Solo insertar si hay valor\n                        entries_to_insert.append((item_id, str(field), str(value), source_type, now))\n            \n            if entries_to_insert:\n                # Opcional: Borrar metadatos viejos de esta fuente antes de insertar nuevos\n                # cursor.execute(\"DELETE FROM metadata WHERE item_id = ? AND source_type = ?\", (item_id, source_type))\n                # self.logger.debug(f\"Metadatos viejos de fuente \'{source_type}\' para item {item_id} borrados antes de nueva inserción.\")\n\n                cursor.executemany(\"INSERT INTO metadata (item_id, field_name, field_value, source_type, created_at) VALUES (?, ?, ?, ?, ?)\", \n                                  entries_to_insert)\n                self.conn.commit()\n                self.logger.info(f\"{len(entries_to_insert)} campo(s) de metadatos guardado(s) para ítem {item_id} desde fuente \'{source_type}\'. Campos: {list(metadata_dict.keys())}\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error guardando metadatos para ítem {item_id}: {e}\")\n            if self.conn: self.conn.rollback()\n            # No relanzar, pero loguear.\n        finally:\n            if cursor: cursor.close()\n    \n    def get_item_metadata(self, item_id):\n        \"\"\"Recupera todos los metadatos para un ítem dado.\"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        metadata = {}\n        try:\n            cursor.execute(\"SELECT field_name, field_value, source_type FROM metadata WHERE item_id = ? ORDER BY metadata_id ASC\", (item_id,))\n            for row in cursor.fetchall():\n                field = row[\'field_name\']\n                value = row[\'field_value\']\n                # Si el campo ya existe, convertirlo a lista si no lo es, y añadir el nuevo valor\n                if field in metadata:\n                    if not isinstance(metadata[field], list):\n                        metadata[field] = [metadata[field]]\n                    metadata[field].append(value)\n                else:\n                    metadata[field] = value\n            return metadata\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo metadatos para ítem {item_id}: {e}\")\n            return {}\n        finally:\n            if cursor: cursor.close()\n\n    def log_file_download_attempt(self, file_id, local_path, file_size_bytes, md5_hash, download_status, file_url=None, file_type=None):\n        \"\"\"Registra o actualiza un intento de descarga de archivo usando file_id.\"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        now = self._now_timestamp()\n        try:\n            # Actualizar el registro existente del archivo\n            sql = \"\"\"\n            UPDATE files \n            SET local_path = ?, file_size_bytes = ?, md5_hash = ?, download_status = ?, \n                download_attempts = download_attempts + 1, last_download_attempt_at = ?, updated_at = ?\n                %s %s\n            WHERE file_id = ?\n            \"\"\"\n            # Solo actualizar file_url y file_type si se proporcionan (para no sobrescribir con None)\n            extra_sets = []\n            params = [local_path, file_size_bytes, md5_hash, download_status, now, now]\n            if file_url is not None:\n                extra_sets.append(\"file_url = ?\")\n                params.append(file_url)\n            if file_type is not None:\n                extra_sets.append(\"file_type = ?\")\n                params.append(file_type)\n            \n            sql_file_url_update = \", \" + extra_sets[0] if len(extra_sets) > 0 else \"\"\n            sql_file_type_update = \", \" + extra_sets[1] if len(extra_sets) > 1 else \"\"\n            \n            final_sql = sql % (sql_file_url_update, sql_file_type_update)\n            params.append(file_id)\n\n            cursor.execute(final_sql, tuple(params))\n            self.conn.commit()\n            if cursor.rowcount > 0:\n                self.logger.info(f\"Intento de descarga para file_id {file_id} registrado/actualizado. Estado: {download_status}, Path: {local_path}\")\n            else:\n                self.logger.warning(f\"No se encontró file_id {file_id} para registrar intento de descarga, o no hubo cambios.\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error registrando intento de descarga para file_id {file_id}: {e}\")\n            if self.conn: self.conn.rollback()\n        finally:\n            if cursor: cursor.close()\n\n    def log_download_attempt_for_item(self, item_id, file_url, file_type, local_path, file_size_bytes, md5_hash, download_status):\n        \"\"\"\n        Registra un intento de descarga de archivo para un ítem. \n        Si ya existe un archivo para este item_id y file_url, lo actualiza.\n        Si no, crea una nueva entrada de archivo.\n        \"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        now = self._now_timestamp()\n        try:\n            # Verificar si ya existe una entrada para este item_id y file_url\n            cursor.execute(\"SELECT file_id FROM files WHERE item_id = ? AND file_url = ?\", (item_id, file_url))\n            row = cursor.fetchone()\n            file_id = row[\'file_id\'] if row else None\n\n            if file_id:\n                # Actualizar el existente usando la otra función\n                self.log_file_download_attempt(file_id, local_path, file_size_bytes, md5_hash, download_status, file_url, file_type)\n            else:\n                # Crear nueva entrada de archivo\n                sql = \"\"\"\n                INSERT INTO files (item_id, file_type, file_url, local_path, download_status, \n                                   md5_hash, file_size_bytes, download_attempts, last_download_attempt_at, \n                                   created_at, updated_at)\n                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) \n                \"\"\"\n                params = (item_id, file_type, file_url, local_path, download_status, \n                          md5_hash, file_size_bytes, now, now, now)\n                cursor.execute(sql, params)\n                new_file_id = cursor.lastrowid\n                self.conn.commit()\n                self.logger.info(f\"Nuevo archivo (ID: {new_file_id}) registrado para ítem {item_id}. URL: {file_url}, Estado: {download_status}\")\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error registrando intento de descarga para ítem {item_id}, URL {file_url}: {e}\")\n            if self.conn: self.conn.rollback()\n        finally:\n            if cursor: cursor.close()\n\n    def get_file_by_path(self, local_path):\n        \"\"\"Obtiene información de un archivo por su ruta local.\"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        try:\n            cursor.execute(\"SELECT * FROM files WHERE local_path = ?\", (local_path,))\n            return cursor.fetchone() # Retorna un objeto Row o None\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo archivo por ruta {local_path}: {e}\")\n            return None\n        finally:\n            if cursor: cursor.close()\n    \n    def get_file_by_url(self, item_id, file_url):\n        \"\"\"Obtiene información de un archivo por su item_id y file_url.\"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        try:\n            cursor.execute(\"SELECT * FROM files WHERE item_id = ? AND file_url = ?\", (item_id, file_url))\n            return cursor.fetchone()\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo archivo por item_id {item_id} y URL {file_url}: {e}\")\n            return None\n        finally:\n            if cursor: cursor.close()\n\n    def get_items_by_status(self, status, limit=None):\n        \"\"\"\n        Obtiene una lista de ítems (solo sus IDs y URLs relevantes) con un estado de procesamiento específico.\n        \"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        items = []\n        try:\n            sql = \"SELECT item_id, item_page_url, oai_identifier, repository_source FROM items WHERE processing_status = ? ORDER BY updated_at ASC\" # Procesar más antiguos primero\n            params = [status]\n            if limit is not None and isinstance(limit, int) and limit > 0:\n                sql += \" LIMIT ?\"\n                params.append(limit)\n            \n            cursor.execute(sql, tuple(params))\n            for row in cursor.fetchall():\n                items.append(dict(row)) # Convertir sqlite3.Row a dict\n            self.logger.info(f\"Encontrados {len(items)} ítems con estado \'{status}\'\" + (f\" (limitado a {limit}).\" if limit else \".\"))\n            return items\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo ítems por estado \'{status}\': {e}\")\n            return []\n        finally:\n            if cursor: cursor.close()\n\n    def get_files_for_item_by_type_and_status(self, item_id, file_type, download_status, limit=None):\n        \"\"\"\n        Obtiene archivos para un ítem específico, filtrando por tipo y estado de descarga.\n        \"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        files_info = []\n        try:\n            sql = \"SELECT file_id, file_url, local_path FROM files WHERE item_id = ? AND file_type = ? AND download_status = ? ORDER BY created_at ASC\"\n            params = [item_id, file_type, download_status]\n            if limit is not None and isinstance(limit, int) and limit > 0:\n                sql += \" LIMIT ?\"\n                params.append(limit)\n            \n            cursor.execute(sql, tuple(params))\n            for row in cursor.fetchall():\n                files_info.append(dict(row))\n            self.logger.debug(f\"Encontrados {len(files_info)} archivos para ítem {item_id} con tipo \'{file_type}\' y estado \'{download_status}\'.\")\n            return files_info\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo archivos para ítem {item_id} (tipo: {file_type}, estado: {download_status}): {e}\")\n            return []\n        finally:\n            if cursor: cursor.close()\n\n    def get_all_processed_items_summary(self, limit=None):\n        \"\"\"\n        Obtiene un resumen de todos los ítems que han sido \'processed\' o tuvieron un fallo final.\n        Incluye metadatos básicos y la información de los PDFs descargados (si los hay).\n        \"\"\"\n        self.connect()\n        cursor = self.conn.cursor()\n        summary_data = []\n        try:\n            # Esta query puede ser compleja y lenta si hay muchos datos. Optimizar si es necesario.\n            # Seleccionamos ítems que están \'processed\' o en algún estado final de fallo.\n            sql = \"\"\"\n            SELECT i.item_id, i.item_page_url, i.oai_identifier, i.repository_source, i.processing_status,\n                   (SELECT GROUP_CONCAT(m.field_value, \'; \') FROM metadata m WHERE m.item_id = i.item_id AND m.field_name = \'title\') as titles,\n                   (SELECT GROUP_CONCAT(m.field_value, \'; \') FROM metadata m WHERE m.item_id = i.item_id AND m.field_name = \'creator\') as creators, -- o \'author\'\n                   (SELECT GROUP_CONCAT(m.field_value, \'; \') FROM metadata m WHERE m.item_id = i.item_id AND m.field_name = \'date\') as dates, -- o \'publication_date\'\n                   (SELECT GROUP_CONCAT(f.file_url || \'|\' || f.local_path || \'|\' || f.download_status || \'|\' || COALESCE(f.md5_hash, \'\') || \'|\' || COALESCE(f.file_size_bytes, 0), \';;; \') \n                    FROM files f WHERE f.item_id = i.item_id AND f.file_type = \'pdf\') as pdf_files\n            FROM items i \n            WHERE i.processing_status = \'processed\' OR i.processing_status LIKE \'%failed%\' OR i.processing_status = \'deleted\'\n            ORDER BY i.updated_at DESC\n            \"\"\"\n            params = []\n            if limit is not None and isinstance(limit, int) and limit > 0:\n                sql += \" LIMIT ?\"\n                params.append(limit)\n            \n            cursor.execute(sql, tuple(params))\n            for row in cursor.fetchall():\n                item_info = dict(row)\n                # Parsear la info de pdf_files (que está concatenada)\n                if item_info.get(\'pdf_files\'):\n                    parsed_pdfs = []\n                    for pdf_entry_str in item_info[\'pdf_files\'].split(\';;; \'):\n                        parts = pdf_entry_str.split(\'|\')\n                        if len(parts) == 5:\n                            parsed_pdfs.append({\n                                \'url\': parts[0],\n                                \'local_path\': parts[1],\n                                \'status\': parts[2],\n                                \'md5\': parts[3],\n                                \'size\': int(parts[4])\n                            })\n                    item_info[\'pdf_files_info\'] = parsed_pdfs\n                else:\n                    item_info[\'pdf_files_info\'] = []\n                del item_info[\'pdf_files\'] # Remover la cadena concatenada original\n                summary_data.append(item_info)\n            \n            self.logger.info(f\"Se obtuvo resumen de {len(summary_data)} ítems procesados/fallidos.\")\n            return summary_data\n        except sqlite3.Error as e:\n            self.logger.error(f\"Error obteniendo resumen de ítems procesados: {e}\")\n            return []\n        finally:\n            if cursor: cursor.close()\n\n# Ejemplo de uso:\nif __name__ == \'__main__\':\n    # Crear un logger básico para la prueba\n    logging.basicConfig(level=logging.INFO, format=\'%(asctime)s - %(name)s - %(levelname)s - %(message)s\')\n    test_logger = logging.getLogger(\"DBManagerTest\")\n\n    # Usar una base de datos en memoria para pruebas rápidas, o un archivo\n    # db_path = \':memory:\'\n    db_path = \'BR_test_scraper.db\' \n    if os.path.exists(db_path):\n        test_logger.info(f\"Borrando base de datos de prueba existente: {db_path}\")\n        os.remove(db_path)\n\n    db_manager = DatabaseManagerBR(db_path, test_logger)\n\n    test_logger.info(\"--- Iniciando pruebas del DatabaseManagerBR ---\")\n\n    # 1. Probar get_or_create_item\n    test_logger.info(\"\\n1. Probando get_or_create_item...\")\n    item1_id, created1 = db_manager.get_or_create_item(oai_identifier=\"oai:test:item1\", repository_source=\"TestOAIRepo\")\n    test_logger.info(f\"Item 1: ID={item1_id}, Creado={created1}\")\n    assert created1 is True\n\n    item1_id_again, created1_again = db_manager.get_or_create_item(oai_identifier=\"oai:test:item1\", repository_source=\"TestOAIRepo\")\n    test_logger.info(f\"Item 1 (de nuevo): ID={item1_id_again}, Creado={created1_again}\")\n    assert created1_again is False and item1_id == item1_id_again\n\n    item2_id, created2 = db_manager.get_or_create_item(item_page_url=\"http://example.com/item2\", repository_source=\"TestWebRepo\")\n    test_logger.info(f\"Item 2: ID={item2_id}, Creado={created2}\")\n    assert created2 is True\n    \n    # Asociar OAI ID a item existente por URL\n    item2_id_updated, created2_updated = db_manager.get_or_create_item(oai_identifier=\"oai:test:item2_from_web\", item_page_url=\"http://example.com/item2\", repository_source=\"TestOAIRepoForWebItem2\")\n    test_logger.info(f\"Item 2 (actualizado con OAI): ID={item2_id_updated}, Creado={created2_updated}\")\n    assert created2_updated is False and item2_id == item2_id_updated\n\n    # 2. Probar update_item_status\n    test_logger.info(\"\\n2. Probando update_item_status...\")\n    db_manager.update_item_status(item1_id, \"processed\", \"Todo OK\")\n    db_manager.update_item_status(item2_id, \"failed\", \"No se encontró PDF\")\n\n    # 3. Probar log_item_metadata y get_item_metadata\n    test_logger.info(\"\\n3. Probando log_item_metadata y get_item_metadata...\")\n    meta1 = {\n        \"title\": \"Título del Ítem 1\", \n        \"creator\": [\"Autor A\", \"Autor B\"],\n        \"date\": \"2023-01-15\",\n        \"description\": \"Descripción larga del ítem 1...\"\n    }\n    db_manager.log_item_metadata(item1_id, meta1, \"oai\")\n    retrieved_meta1 = db_manager.get_item_metadata(item1_id)\n    test_logger.info(f\"Metadatos recuperados para Item 1: {retrieved_meta1}\")\n    assert retrieved_meta1.get(\'title\') == \"Título del Ítem 1\"\n    assert isinstance(retrieved_meta1.get(\'creator\'), list) and len(retrieved_meta1.get(\'creator\')) == 2\n\n    # 4. Probar log_download_attempt_for_item y get_file_by_url/path\n    test_logger.info(\"\\n4. Probando descargas de archivos...\")\n    db_manager.log_download_attempt_for_item(item1_id, \"http://example.com/item1.pdf\", \"pdf\", \"/path/to/item1.pdf\", 102400, \"md5hash123\", \"downloaded\")\n    db_manager.log_download_attempt_for_item(item2_id, \"http://example.com/item2.pdf\", \"pdf\", None, 0, None, \"failed_download\")\n    \n    file_info1_url = db_manager.get_file_by_url(item1_id, \"http://example.com/item1.pdf\")\n    test_logger.info(f\"Info archivo 1 (por URL): {dict(file_info1_url) if file_info1_url else None}\")\n    assert file_info1_url and file_info1_url[\'md5_hash\'] == \"md5hash123\"\n\n    file_info1_path = db_manager.get_file_by_path(\"/path/to/item1.pdf\")\n    test_logger.info(f\"Info archivo 1 (por Path): {dict(file_info1_path) if file_info1_path else None}\")\n    assert file_info1_path and file_info1_path[\'download_status\'] == \"downloaded\"\n    \n    # Probar actualizar un intento de descarga existente\n    file_id_to_update = file_info1_path[\'file_id\']\n    db_manager.log_file_download_attempt(file_id_to_update, \"/path/to/item1_v2.pdf\", 102500, \"newmd5\", \"verified\", file_url=\"http://example.com/item1_updated.pdf\")\n    updated_file_info = db_manager.get_file_by_path(\"/path/to/item1_v2.pdf\")\n    test_logger.info(f\"Info archivo 1 (actualizado): {dict(updated_file_info) if updated_file_info else None}\")\n    assert updated_file_info and updated_file_info[\'md5_hash\'] == \"newmd5\" and updated_file_info[\'file_url\'] == \"http://example.com/item1_updated.pdf\"\n\n    # 5. Probar get_items_by_status\n    test_logger.info(\"\\n5. Probando get_items_by_status...\")\n    processed_items = db_manager.get_items_by_status(\"processed\")\n    test_logger.info(f\"Ítems \'processed\': {processed_items}\")\n    assert len(processed_items) >= 1 and processed_items[0][\'item_id\'] == item1_id\n\n    failed_items = db_manager.get_items_by_status(\"failed\", limit=1)\n    test_logger.info(f\"Ítems \'failed\' (limit 1): {failed_items}\")\n    assert len(failed_items) == 1 and failed_items[0][\'item_id\'] == item2_id\n\n    # 6. Probar get_files_for_item_by_type_and_status\n    test_logger.info(\"\\n6. Probando get_files_for_item_by_type_and_status...\")\n    item1_pdfs_downloaded = db_manager.get_files_for_item_by_type_and_status(item1_id, \'pdf\', \'verified\')\n    test_logger.info(f\"PDFs \'verified\' para Item 1: {item1_pdfs_downloaded}\")\n    assert len(item1_pdfs_downloaded) >= 1\n\n    # 7. Probar get_all_processed_items_summary\n    test_logger.info(\"\\n7. Probando get_all_processed_items_summary...\")\n    summary = db_manager.get_all_processed_items_summary(limit=5)\n    test_logger.info(f\"Resumen de ítems procesados (JSONizable):\\n{json.dumps(summary, indent=2)}\")\n    assert len(summary) >= 2 # item1 (processed) y item2 (failed)\n    # Verificar que la estructura de pdf_files_info sea correcta para el item1\n    item1_summary = next((s for s in summary if s[\'item_id\'] == item1_id), None)\n    assert item1_summary and len(item1_summary[\'pdf_files_info\']) >= 1\n    assert item1_summary[\'pdf_files_info\'][0][\'md5\'] == \"newmd5\"\n\n    # 8. Probar marcar OAI como eliminado\n    test_logger.info(\"\\n8. Probando marcar OAI como eliminado...\")\n    db_manager.mark_oai_item_as_deleted(\"oai:test:item_to_delete\", \"TestOAIRepo\")\n    deleted_item = db_manager.get_items_by_status(\'deleted\')\n    test_logger.info(f\"Ítems \'deleted\': {deleted_item}\")\n    assert len(deleted_item) >= 1 and deleted_item[0][\'oai_identifier\'] == \"oai:test:item_to_delete\"\n\n    db_manager.close()\n    test_logger.info(\"--- Pruebas del DatabaseManagerBR finalizadas. ---\")\n    if db_path != \':memory:\' and os.path.exists(db_path):\n         test_logger.info(f\"La base de datos de prueba se guardó en: {os.path.abspath(db_path)}\")\n
+import sqlite3
+import os
+import logging
+import json
+import datetime
+
+class DatabaseManagerBR:
+    def __init__(self, db_file, logger_instance=None):
+        self.db_file = db_file
+        if logger_instance:
+            self.logger = logger_instance
+        else:
+            self.logger = logging.getLogger("DatabaseManagerBR")
+            # Configurar un logger básico si no se proporciona uno
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+                self.logger.setLevel(logging.INFO)
+        
+        self._ensure_db_directory()
+        # La inicialización de la BD se llamará explícitamente desde el scraper principal
+        # para asegurar que el logger del scraper esté completamente configurado.
+
+    def _ensure_db_directory(self):
+        db_dir = os.path.dirname(self.db_file)
+        if db_dir and not os.path.exists(db_dir):
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+                self.logger.info(f"Directorio de base de datos creado: {db_dir}")
+            except OSError as e:
+                self.logger.error(f"Error creando directorio para la base de datos {db_dir}: {e}")
+                raise
+
+    def _connect(self):
+        """Conecta a la base de datos SQLite y devuelve un objeto de conexión."""
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=10) # Aumentar timeout si hay concurrencia
+            conn.row_factory = sqlite3.Row
+            # Habilitar WAL mode para mejor concurrencia (si es apropiado para el uso)
+            # conn.execute("PRAGMA journal_mode=WAL") 
+            return conn
+        except sqlite3.Error as e:
+            self.logger.error(f"Error al conectar con la base de datos {self.db_file}: {e}")
+            raise # Re-lanzar para que el llamador maneje el fallo de conexión
+
+    def initialize_db(self):
+        """Inicializa la base de datos creando las tablas si no existen."""
+        conn = None # Asegurar que conn esté definida
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            self.logger.info(f"Inicializando/verificando esquema de BD en {self.db_file}...")
+
+            # Tabla items:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_page_url TEXT UNIQUE NOT NULL, -- URL canónica de la página del ítem
+                oai_identifier TEXT,              -- Identificador OAI, puede ser NULO si no es de OAI
+                repository_source TEXT,           -- Ej: 'alice', 'infoteca-e', 'web_search'
+                discovery_mode TEXT,              -- Ej: 'oai', 'keyword_search'
+                search_keyword TEXT,              -- Palabra clave si discovery_mode es 'keyword_search'
+                processing_status TEXT DEFAULT 'pending_metadata', -- Estado actual del procesamiento del ítem
+                metadata_json TEXT,               -- JSON con los metadatos extraídos
+                html_local_path TEXT,             -- Ruta al snapshot HTML de la página del ítem
+                last_processed_timestamp TEXT,    -- Cuándo se procesó/actualizó por última vez
+                created_timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+            self.logger.debug("Tabla 'items' verificada/creada.")
+
+            # Índices para la tabla items
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_oai_repo ON items (oai_identifier, repository_source) WHERE oai_identifier IS NOT NULL AND repository_source IS NOT NULL")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_items_page_url ON items (item_page_url)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_items_processing_status ON items (processing_status)")
+            self.logger.debug("Índices para 'items' verificados/creados.")
+
+            # Tabla files:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                file_type TEXT NOT NULL,          -- Ej: 'pdf', 'thumbnail', 'supplementary'
+                remote_url TEXT UNIQUE NOT NULL,  -- URL original del archivo
+                local_path TEXT,                  -- Ruta local si se descargó
+                download_status TEXT DEFAULT 'pending', -- Ej: 'pending', 'downloaded', 'failed_download', 'skipped_exists'
+                md5_hash TEXT,
+                file_size_bytes INTEGER,
+                download_timestamp TEXT,
+                last_attempt_timestamp TEXT,
+                FOREIGN KEY (item_id) REFERENCES items (item_id) ON DELETE CASCADE
+            )
+            """)
+            self.logger.debug("Tabla 'files' verificada/creada.")
+
+            # Índices para la tabla files
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_item_id ON files (item_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_remote_url ON files (remote_url)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_status_type ON files (download_status, file_type)")
+            self.logger.debug("Índices para 'files' verificados/creados.")
+
+            conn.commit()
+            self.logger.info(f"Base de datos inicializada/verificada exitosamente en {self.db_file}")
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite al inicializar la base de datos: {e}")
+            if conn: conn.rollback()
+        except Exception as e:
+            self.logger.error(f"Error inesperado al inicializar la base de datos: {e}", exc_info=True)
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+    # --- Métodos para Items --- 
+    def get_or_create_item(self, item_page_url, repository_source=None, oai_identifier=None, discovery_mode=None, search_keyword=None, initial_status='pending_metadata'):
+        """Obtiene un ítem por item_page_url. Si no existe, lo crea.
+           Devuelve el item_id y su processing_status actual.
+        """
+        if not item_page_url: 
+            self.logger.error("get_or_create_item llamado sin item_page_url")
+            return None, None
+
+        conn = self._connect()
+        cursor = conn.cursor()
+        item_id = None
+        current_status = None
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+        try:
+            cursor.execute("SELECT item_id, processing_status FROM items WHERE item_page_url = ?", (item_page_url,))
+            row = cursor.fetchone()
+            if row:
+                item_id = row['item_id']
+                current_status = row['processing_status']
+                # Actualizar last_processed_timestamp si ya existe, podría ser opcional
+                # cursor.execute("UPDATE items SET last_processed_timestamp = ? WHERE item_id = ?", (now, item_id))
+                self.logger.debug(f"Ítem existente encontrado ID {item_id} para URL: {item_page_url}")
+            else:
+                sql = """INSERT INTO items 
+                           (item_page_url, oai_identifier, repository_source, discovery_mode, search_keyword, processing_status, last_processed_timestamp, created_timestamp)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
+                cursor.execute(sql, (item_page_url, oai_identifier, repository_source, discovery_mode, search_keyword, initial_status, now, now))
+                item_id = cursor.lastrowid
+                current_status = initial_status
+                self.logger.info(f"Nuevo ítem creado ID {item_id} para URL: {item_page_url}, Repo: {repository_source}")
+            conn.commit()
+        except sqlite3.IntegrityError as ie:
+             # Esto podría pasar si hay una condición de carrera o un UNIQUE constraint falla inesperadamente
+             self.logger.error(f"Error de integridad SQLite en get_or_create_item para URL {item_page_url}: {ie}")
+             if conn: conn.rollback()
+             # Intentar leerlo de nuevo por si se creó en otro hilo/proceso justo ahora
+             cursor.execute("SELECT item_id, processing_status FROM items WHERE item_page_url = ?", (item_page_url,))
+             row = cursor.fetchone()
+             if row: item_id, current_status = row['item_id'], row['processing_status']
+             else: raise # Si sigue sin encontrarlo, relanzar el error
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite en get_or_create_item para URL {item_page_url}: {e}")
+            if conn: conn.rollback()
+            raise
+        finally:
+            if conn: conn.close()
+        return item_id, current_status
+
+    def update_item_status(self, item_id, new_status):
+        """Actualiza el processing_status y last_processed_timestamp de un ítem."""
+        if item_id is None:
+            self.logger.error("update_item_status llamado con item_id None.")
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+        conn = self._connect()
+        cursor = conn.cursor()
+        updated = False
+        try:
+            cursor.execute("UPDATE items SET processing_status = ?, last_processed_timestamp = ? WHERE item_id = ?", 
+                           (new_status, now, item_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                self.logger.info(f"Estado del ítem ID {item_id} actualizado a: {new_status}")
+                updated = True
+            else:
+                self.logger.warning(f"No se encontró el ítem ID {item_id} para actualizar estado a {new_status}.")
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite actualizando estado para ítem ID {item_id}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+        return updated
+
+    def log_item_metadata(self, item_id, metadata_dict, html_path=None):
+        """Almacena/actualiza los metadatos (como JSON) y la ruta del snapshot HTML de un ítem."""
+        if item_id is None:
+            self.logger.error("log_item_metadata llamado con item_id None.")
+            return False
+        
+        updates = []
+        params = []
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+        if metadata_dict:
+            try:
+                metadata_json_str = json.dumps(metadata_dict, ensure_ascii=False)
+                updates.append("metadata_json = ?")
+                params.append(metadata_json_str)
+            except TypeError as te:
+                self.logger.error(f"Error serializando metadatos a JSON para item ID {item_id}: {te}")
+                # No añadir metadata_json si falla la serialización
+        
+        if html_path:
+            updates.append("html_local_path = ?")
+            params.append(html_path)
+        
+        if not updates: # No hay nada que actualizar
+            self.logger.debug(f"log_item_metadata llamado para item ID {item_id} pero sin metadatos ni html_path para actualizar.")
+            return False
+
+        updates.append("last_processed_timestamp = ?")
+        params.append(now)
+        params.append(item_id) # Para el WHERE clause
+
+        conn = self._connect()
+        cursor = conn.cursor()
+        updated_meta = False
+        try:
+            sql = f"UPDATE items SET { ', '.join(updates) } WHERE item_id = ?"
+            cursor.execute(sql, tuple(params))
+            conn.commit()
+            if cursor.rowcount > 0:
+                self.logger.info(f"Metadatos y/o HTML path para ítem ID {item_id} actualizados/guardados.")
+                updated_meta = True
+            else:
+                self.logger.warning(f"No se encontró el ítem ID {item_id} para actualizar metadatos/HTML path.")
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite actualizando metadatos/HTML path para ítem ID {item_id}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+        return updated_meta
+
+    def get_item_details(self, item_id):
+        """Obtiene todos los detalles de un ítem por su ID."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM items WHERE item_id = ?", (item_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            else:
+                self.logger.warning(f"No se encontró ítem con ID {item_id}")
+                return None
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite obteniendo detalles del ítem ID {item_id}: {e}")
+            return None
+        finally:
+            if conn: conn.close()
+
+    def get_items_to_process(self, statuses=None, discovery_modes=None, limit=None):
+        """Obtiene ítems que necesitan procesamiento, opcionalmente filtrados por estado(s) y modo(s) de descubrimiento."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        items = []
+        
+        base_sql = "SELECT item_id, item_page_url, oai_identifier, repository_source, discovery_mode, metadata_json, processing_status FROM items"
+        conditions = []
+        params = []
+
+        if statuses:
+            if isinstance(statuses, str):
+                statuses = [statuses]
+            placeholders = ', '.join('?' * len(statuses))
+            conditions.append(f"processing_status IN ({placeholders})")
+            params.extend(statuses)
+        
+        if discovery_modes:
+            if isinstance(discovery_modes, str):
+                discovery_modes = [discovery_modes]
+            placeholders = ', '.join('?' * len(discovery_modes))
+            conditions.append(f"discovery_mode IN ({placeholders})")
+            params.extend(discovery_modes)
+
+        if conditions:
+            base_sql += " WHERE " + " AND ".join(conditions)
+        
+        base_sql += " ORDER BY last_processed_timestamp ASC, created_timestamp ASC" # Priorizar más antiguos / menos procesados
+
+        if limit is not None and isinstance(limit, int) and limit > 0:
+            base_sql += " LIMIT ?"
+            params.append(limit)
+
+        try:
+            cursor.execute(base_sql, tuple(params))
+            for row in cursor.fetchall():
+                item_dict = dict(row)
+                # Parsear metadata_json si existe
+                # if item_dict.get('metadata_json'):
+                #     try:
+                #         item_dict['metadata_json'] = json.loads(item_dict['metadata_json'])
+                #     except json.JSONDecodeError:
+                #         self.logger.warning(f"Error decodificando metadata_json para item_id {item_dict['item_id']}. Se devolverá como string.")
+                items.append(item_dict)
+            self.logger.info(f"Se encontraron {len(items)} ítems para procesar. Filtros: statuses={statuses}, modes={discovery_modes}, limit={limit}")
+            return items
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite obteniendo ítems para procesar: {e}. SQL: {base_sql}, Params: {params}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    # --- Métodos para Files ---
+    def log_file_attempt(self, item_id, file_type, remote_url):
+        """Registra un intento de descarga de archivo. Crea o actualiza la entrada del archivo."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT file_id FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
+            row = cursor.fetchone()
+            if row: # Actualizar intento
+                # cursor.execute("UPDATE files SET last_attempt_timestamp = ? WHERE file_id = ?", (now, row['file_id']))
+                # La lógica de actualizar el intento está implícita en log_file_result, no es necesario aquí.
+                pass
+            else: # Crear nueva entrada de archivo
+                cursor.execute("""INSERT INTO files (item_id, file_type, remote_url, download_status, last_attempt_timestamp)
+                                  VALUES (?, ?, ?, ?, ?)""", 
+                               (item_id, file_type, remote_url, 'pending', now))
+            conn.commit()
+            # self.logger.debug(f"Intento de descarga para item {item_id}, URL {remote_url} registrado/actualizado.")
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite registrando intento de descarga para item {item_id}, URL {remote_url}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+
+    def log_file_result(self, item_id, file_type, remote_url, download_status, 
+                          local_path=None, md5_hash=None, file_size_bytes=None):
+        """Registra el resultado de una descarga de archivo (éxito o fallo)."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+        conn = self._connect()
+        cursor = conn.cursor()
+        logged = False
+        try:
+            # Verificar si el archivo ya existe para este item_id y remote_url
+            cursor.execute("SELECT file_id FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
+            row = cursor.fetchone()
+
+            if row: # Actualizar el registro existente
+                file_id = row['file_id']
+                updates = []
+                params_update = []
+                if local_path is not None: updates.append("local_path = ?"); params_update.append(local_path)
+                if md5_hash is not None: updates.append("md5_hash = ?"); params_update.append(md5_hash)
+                if file_size_bytes is not None: updates.append("file_size_bytes = ?"); params_update.append(file_size_bytes)
+                updates.append("download_status = ?"); params_update.append(download_status)
+                updates.append("last_attempt_timestamp = ?"); params_update.append(now)
+                if download_status == 'downloaded':
+                     updates.append("download_timestamp = ?"); params_update.append(now)
+                
+                params_update.append(file_id) # Para el WHERE
+                
+                sql_update = f"UPDATE files SET { ', '.join(updates) } WHERE file_id = ?"
+                cursor.execute(sql_update, tuple(params_update))
+                self.logger.info(f"Resultado de descarga para archivo existente ID {file_id} (Item {item_id}, URL {remote_url}) actualizado a: {download_status}")
+            else: # Crear un nuevo registro de archivo
+                dt = now if download_status == 'downloaded' else None # Download timestamp solo si fue exitoso
+                cursor.execute("""INSERT INTO files 
+                                  (item_id, file_type, remote_url, local_path, download_status, md5_hash, file_size_bytes, download_timestamp, last_attempt_timestamp)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                               (item_id, file_type, remote_url, local_path, download_status, md5_hash, file_size_bytes, dt, now))
+                self.logger.info(f"Nuevo archivo registrado para item {item_id} (URL {remote_url}). Estado: {download_status}, Path: {local_path}")
+            
+            conn.commit()
+            logged = True
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite registrando resultado de descarga para item {item_id}, URL {remote_url}: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+        return logged
+
+    def get_file_status(self, item_id, remote_url):
+        """Obtiene el download_status y local_path de un archivo por item_id y remote_url."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT download_status, local_path FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
+            row = cursor.fetchone()
+            if row:
+                return row['download_status'], row['local_path']
+            return None, None # No encontrado
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite obteniendo estado de archivo para item {item_id}, URL {remote_url}: {e}")
+            return None, None
+        finally:
+            if conn: conn.close()
+
+    def get_downloaded_files_for_item(self, item_id, file_type='pdf'):
+        """Obtiene una lista de archivos descargados (con su ruta local) para un ítem específico y tipo de archivo."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        files = []
+        try:
+            cursor.execute("SELECT local_path, remote_url, md5_hash, file_size_bytes FROM files WHERE item_id = ? AND file_type = ? AND download_status IN ('downloaded', 'skipped_exists')", 
+                           (item_id, file_type))
+            for row in cursor.fetchall():
+                files.append(dict(row))
+            return files
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite obteniendo archivos descargados para ítem {item_id}: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    def get_all_items_for_report(self):
+        """Prepara datos para reportes como state.json. Devuelve una lista de dicts con info de ítems y sus PDFs."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        items_report_data = []
+        try:
+            # Obtener todos los ítems primero
+            cursor.execute("SELECT item_id, item_page_url, oai_identifier, repository_source, processing_status, metadata_json, html_local_path FROM items ORDER BY item_id")
+            all_items_rows = cursor.fetchall()
+
+            for item_row_raw in all_items_rows:
+                item_data = dict(item_row_raw)
+                item_id = item_data['item_id']
+                
+                # Parsear metadata_json si existe
+                if item_data.get('metadata_json'):
+                    try:
+                        item_data['metadata_json'] = json.loads(item_data['metadata_json'])
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"Error decodificando metadata_json para item_id {item_id} en get_all_items_for_report. Se dejará como string.")
+                else:
+                    item_data['metadata_json'] = {} # Asegurar que sea un dict si es None
+
+                # Obtener archivos PDF para este ítem
+                cursor.execute("SELECT remote_url, local_path, download_status FROM files WHERE item_id = ? AND file_type = 'pdf'", (item_id,))
+                pdf_files_for_item = [dict(pdf_row) for pdf_row in cursor.fetchall()]
+                item_data['pdfs'] = pdf_files_for_item
+                
+                items_report_data.append(item_data)
+                
+            self.logger.info(f"Se prepararon datos de reporte para {len(items_report_data)} ítems.")
+            return items_report_data
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite preparando datos de reporte para todos los ítems: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    def get_sample_downloaded_pdfs_for_report(self, max_results=5):
+        """Obtiene una muestra de PDFs descargados con sus metadatos de ítem para el test_results.json."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        pdf_report_data = []
+        try:
+            # Seleccionar archivos PDF descargados y unir con la tabla de ítems para obtener metadatos del ítem
+            # Usamos una subconsulta para seleccionar file_ids aleatorios o los primeros N para la muestra.
+            # SQLite puede ser peculiar con RAND(), así que LIMIT puede ser más predecible.
+            sql = """
+            SELECT 
+                f.remote_url, f.local_path, f.md5_hash, f.file_size_bytes,
+                i.item_id, i.item_page_url, i.metadata_json 
+            FROM files f
+            JOIN items i ON f.item_id = i.item_id
+            WHERE f.file_type = 'pdf' AND f.download_status IN ('downloaded', 'skipped_exists')
+            ORDER BY f.file_id -- Opcional: o RANDOM()
+            LIMIT ?
+            """
+            cursor.execute(sql, (max_results,))
+            for row_raw in cursor.fetchall():
+                pdf_entry = dict(row_raw)
+                # Parsear metadata_json del ítem asociado
+                if pdf_entry.get('metadata_json'):
+                    try:
+                        pdf_entry['metadata_json'] = json.loads(pdf_entry['metadata_json'])
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"Error decodificando metadata_json del ítem {pdf_entry['item_id']} para el reporte de PDF muestreado. Se dejará como string.")
+                else:
+                    pdf_entry['metadata_json'] = {} # Asegurar dict si es None
+                pdf_report_data.append(pdf_entry)
+            
+            self.logger.info(f"Se obtuvo una muestra de {len(pdf_report_data)} PDFs descargados para reporte.")
+            return pdf_report_data
+        except sqlite3.Error as e:
+            self.logger.error(f"Error SQLite obteniendo muestra de PDFs descargados: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    # --- Funciones de utilidad / chequeo (ejemplos, pueden no ser todas necesarias) ---
+    def check_item_exists(self, oai_identifier):
+        """Verifica si un ítem existe basado en su identificador OAI."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT item_id FROM items WHERE oai_identifier = ?", (oai_identifier,))
+            return cursor.fetchone() is not None
+        except sqlite3.Error as e:
+            self.logger.error(f"Error verificando existencia del ítem OAI {oai_identifier}: {e}")
+            return False # Asumir que no existe si hay error
+        finally:
+            if conn: conn.close()
+
+    # Este es un método de conveniencia que combina get_or_create e update_status
+    # Puede ser útil en OAIHarvester
+    def register_item(self, item_page_url, repository_source=None, oai_identifier=None, discovery_mode=None, search_keyword=None, initial_status='pending_metadata'):
+        """Simplifica el registro o actualización de un ítem, devolviendo su ID y si fue recién creado."""
+        item_id, current_status = self.get_or_create_item(
+            item_page_url=item_page_url, 
+            repository_source=repository_source, 
+            oai_identifier=oai_identifier,
+            discovery_mode=discovery_mode,
+            search_keyword=search_keyword,
+            initial_status=initial_status
+        )
+        created = (current_status == initial_status) # Asumimos que si el estado es el inicial, fue creado ahora
+                                                 # Esto es una simplificación, get_or_create_item podría ser más preciso
+        return item_id, created
+
+# No incluir el bloque if __name__ == '__main__' aquí, ya que este archivo es un módulo
+# Las pruebas unitarias deben estar en un archivo de prueba separado (ej. test_database_manager_br.py)
+# o ejecutarse condicionalmente si este archivo se ejecuta como script principal (pero es menos ideal para módulos).
