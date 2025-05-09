@@ -1,394 +1,416 @@
 import requests
-import time
-from lxml import etree # Usar etree para parsear XML
 import logging
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+import time
+from lxml import etree # For parsing XML
+from urllib.parse import urlencode
+
+# OAI-PMH specific constants
+OAI_VERB_LIST_RECORDS = "ListRecords"
+OAI_METADATA_PREFIX_DC = "oai_dc" # Dublin Core
+
+# Mock classes for testing if real DB manager is not available
+class MockDBManager:
+    def get_or_create_item(self, repository_source, oai_identifier=None, item_page_url=None, initial_status='pending_pdf_link'):
+        print(f"DB: Get/Create item for source={repository_source}, oai_id={oai_identifier}")
+        return (int(time.time()*1000)%100000, True) # Simulate item_id, is_new
+    def update_item_status(self, item_id, status):
+        print(f"DB: Update item_id={item_id} to status={status}")
+    def log_item_metadata(self, item_id, title=None, publication_date=None, abstract=None, doi=None, authors=None, keywords=None, pdf_url_harvested=None):
+        print(f"DB: Log metadata for item_id={item_id}, title={title}")
 
 class OAIHarvesterBR:
     """
-    Clase para cosechar metadatos de repositorios OAI-PMH, adaptada para Brasil (BR).
-    Extrae metadatos en formato Dublin Core (oai_dc).
+    Handles harvesting metadata from OAI-PMH compliant repositories for Brazil.
+    Extracts Dublin Core metadata and manages pagination with resumption tokens.
     """
 
-    def __init__(self, config, logger, db_manager):
+    def __init__(self, config, logger=None, db_manager=None, selectors_dict=None):
         """
-        Inicializa el OAIHarvesterBR.
+        Initializes the OAIHarvesterBR.
 
         Args:
-            config (dict): Configuración del scraper.
-            logger (logging.Logger): Instancia del logger.
-            db_manager (DatabaseManagerBR): Instancia del gestor de base de datos.
+            config (dict): Configuration dictionary.
+            logger (logging.Logger, optional): Logger instance.
+            db_manager (DatabaseManagerBR, optional): Database manager instance.
+            selectors_dict (dict, optional): Dictionary of selectors (mainly for OAI XML parsing keys).
         """
         self.config = config
-        self.logger = logger if logger else logging.getLogger(__name__)
+        self.logger = logger or logging.getLogger(__name__)
         self.db_manager = db_manager
         
-        self.oai_base_url = None # Se establecerá para cada repositorio
-        self.metadata_prefix = self.config.get('oai_metadata_prefix', 'oai_dc')
-        self.request_timeout = self.config.get('oai_request_timeout', 60) # segundos
-        self.max_retries = self.config.get('oai_max_retries', 3)
-        self.retry_delay = self.config.get('oai_retry_delay', 10) # segundos
-        self.user_agent = self.config.get('user_agent', 'OAIHarvesterBR/1.0 (compatible; Python Requests)')
-        self.max_records_to_fetch_total = self.config.get('oai_max_records_total_per_repo', None) # Límite global por repo
-        self.from_date = self.config.get('oai_from_date', None) # Formato YYYY-MM-DD
-        self.until_date = self.config.get('oai_until_date', None) # Formato YYYY-MM-DD
-        self.set_spec = self.config.get('oai_set_spec', None) # Especificación del conjunto OAI
+        self.oai_repositories = config.get('oai_repositories', [])
+        self.request_timeout = config.get('oai_request_timeout', 60) # Seconds
+        self.request_delay = config.get('oai_request_delay_seconds', 3) # Seconds between paginated requests
+        self.max_records_per_repo = config.get('max_records_oai_per_repo', float('inf'))
+        self.user_agent = config.get('user_agent', 'Mozilla/5.0 (compatible; OAIHarvester/1.0; +http://example.com/bot)')
 
-        # Definición de namespaces para el parseo XML, crucial para OAI-PMH
-        self.oai_namespaces = {
-            'oai': 'http://www.openarchives.org/OAI/2.0/',
-            'dc': 'http://purl.org/dc/elements/1.1/',
-            'dcterms': 'http://purl.org/dc/terms/',
-            # Añadir otros namespaces si son necesarios (ej. xoai, etc.)
-        }
+        if selectors_dict and 'oai_selectors' in selectors_dict:
+            self.oai_selectors = selectors_dict['oai_selectors']
+        else:
+            self.logger.warning("OAI selectors not found in selectors_dict. Using default keys for parsing.")
+            # Define default selectors (keys for lxml.etree find) if not provided
+            # These are common paths for OAI-PMH XML using Dublin Core
+            self.oai_selectors = {
+                'record': ".//{http://www.openarchives.org/OAI/2.0/}record",
+                'record_identifier': ".//{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}identifier",
+                'datestamp': ".//{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}datestamp",
+                'dc_title': ".//{http://purl.org/dc/elements/1.1/}title",
+                'dc_creator': ".//{http://purl.org/dc/elements/1.1/}creator",
+                'dc_subject': ".//{http://purl.org/dc/elements/1.1/}subject",
+                'dc_description': ".//{http://purl.org/dc/elements/1.1/}description",
+                'dc_publisher': ".//{http://purl.org/dc/elements/1.1/}publisher",
+                'dc_contributor': ".//{http://purl.org/dc/elements/1.1/}contributor",
+                'dc_date': ".//{http://purl.org/dc/elements/1.1/}date",
+                'dc_type': ".//{http://purl.org/dc/elements/1.1/}type",
+                'dc_format': ".//{http://purl.org/dc/elements/1.1/}format",
+                'dc_identifier': ".//{http://purl.org/dc/elements/1.1/}identifier", # Can be URL, DOI
+                'dc_source': ".//{http://purl.org/dc/elements/1.1/}source",
+                'dc_language': ".//{http://purl.org/dc/elements/1.1/}language",
+                'dc_relation': ".//{http://purl.org/dc/elements/1.1/}relation",
+                'dc_coverage': ".//{http://purl.org/dc/elements/1.1/}coverage",
+                'dc_rights': ".//{http://purl.org/dc/elements/1.1/}rights",
+                'resumption_token': ".//{http://www.openarchives.org/OAI/2.0/}resumptionToken",
+                'oai_error': ".//{http://www.openarchives.org/OAI/2.0/}error"
+            }
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': self.user_agent})
 
-    def _make_oai_request(self, params):
+    def _make_oai_request(self, base_url, params):
         """
-        Realiza una petición al endpoint OAI-PMH con los parámetros dados.
+        Makes a request to the OAI-PMH endpoint.
 
         Args:
-            params (dict): Diccionario de parámetros para la petición OAI.
+            base_url (str): The base URL of the OAI repository.
+            params (dict): Dictionary of OAI parameters (verb, metadataPrefix, etc.).
 
         Returns:
-            lxml.etree._Element: El elemento raíz del XML de respuesta, o None si falla.
+            lxml.etree._Element: The parsed XML tree root, or None on error.
         """
-        if not self.oai_base_url:
-            self.logger.error("La URL base OAI no está configurada.")
+        full_url = f"{base_url}?{urlencode(params)}"
+        self.logger.debug(f"Making OAI request to: {full_url}")
+        try:
+            response = self.session.get(full_url, timeout=self.request_timeout)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            
+            # It's good practice to check content type, though OAI should be XML
+            content_type = response.headers.get('Content-Type', '')
+            if 'xml' not in content_type.lower():
+                self.logger.warning(f"Unexpected content type '{content_type}' for OAI response from {full_url}. Expected XML.")
+                # Still try to parse, it might be mislabeled
+            
+            xml_tree = etree.fromstring(response.content)
+            # Check for OAI-level errors
+            error_elements = xml_tree.xpath(self.oai_selectors.get('oai_error', './/error')) # Fallback xpath
+            if error_elements:
+                for error_element in error_elements:
+                    error_code = error_element.get('code', 'UnknownCode')
+                    error_message = error_element.text or "No error message provided."
+                    self.logger.error(f"OAI-PMH error from {base_url}: Code '{error_code}' - {error_message.strip()}")
+                # Specific error handling for 'noRecordsMatch' which isn't a failure but an empty set
+                if any(err.get('code') == 'noRecordsMatch' for err in error_elements):
+                    self.logger.info(f"OAI Info: No records match the request criteria for {base_url} with params {params}.")
+                    return xml_tree # Return the tree so resumption token (if any) can be checked as empty
+                return None # For other OAI errors
+            return xml_tree
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"HTTP request failed for OAI endpoint {full_url}: {e}")
+            return None
+        except etree.XMLSyntaxError as e:
+            self.logger.error(f"Failed to parse XML response from {full_url}: {e}")
+            self.logger.debug(f"Response content snippet (first 500 chars): {response.content[:500]}")
+            return None
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred during OAI request to {full_url}: {e}")
             return None
 
-        # Limpiar params de valores None antes de codificar
-        cleaned_params = {k: v for k, v in params.items() if v is not None}
-        query_string = urlencode(cleaned_params)
-        request_url = f"{self.oai_base_url}?{query_string}"
-        
-        self.logger.info(f"Realizando petición OAI a: {request_url}")
-        headers = {'User-Agent': self.user_agent, 'Accept': 'application/xml'}
-
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.get(request_url, headers=headers, timeout=self.request_timeout)
-                response.raise_for_status() # Lanza HTTPError para respuestas 4xx/5xx
-
-                # Parsear XML con lxml.etree
-                # Es importante usar response.content para asegurar el manejo correcto de la codificación
-                # que lxml puede auto-detectar o que se puede especificar.
-                xml_tree = etree.fromstring(response.content)
-                self.logger.debug(f"Respuesta OAI XML recibida y parseada exitosamente desde {request_url}")
-                return xml_tree
-            except requests.exceptions.HTTPError as e:
-                self.logger.error(f"Error HTTP {e.response.status_code} en petición OAI a {request_url}: {e.response.text[:500]}...")
-                if e.response.status_code in [400, 403, 404, 422]: # Errores que no suelen resolverse con reintento
-                    # Comprobar si hay un error OAI específico en el XML
-                    try:
-                        error_tree = etree.fromstring(e.response.content)
-                        oai_error = error_tree.find('.//oai:error', namespaces=self.oai_namespaces)
-                        if oai_error is not None:
-                            error_code = oai_error.get('code', 'N/A')
-                            error_message = oai_error.text.strip() if oai_error.text else 'No message'
-                            self.logger.error(f"Error OAI específico: Code='{error_code}', Message='{error_message}'")
-                    except Exception as xml_parse_error:
-                        self.logger.warning(f"No se pudo parsear el cuerpo del error OAI como XML: {xml_parse_error}")
-                    break # Salir del bucle de reintentos
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"Error de red en petición OAI a {request_url} (intento {attempt + 1}/{self.max_retries}): {e}")
-            except etree.XMLSyntaxError as e:
-                self.logger.error(f"Error de sintaxis XML parseando respuesta de {request_url} (intento {attempt + 1}/{self.max_retries}): {e}")
-                self.logger.debug(f"Contenido XML problemático (primeros 500 chars): {response.content[:500]}")
-            
-            if attempt < self.max_retries - 1:
-                self.logger.info(f"Reintentando en {self.retry_delay} segundos...")
-                time.sleep(self.retry_delay)
-            else:
-                self.logger.error(f"Fallaron todos los intentos para la petición OAI a {request_url}")
-        return None
-
-    def _parse_oai_response(self, xml_tree):
+    def _parse_record(self, record_element):
         """
-        Parsea la respuesta XML de OAI-PMH para extraer registros y el resumptionToken.
+        Parses a single OAI <record> element to extract metadata.
 
         Args:
-            xml_tree (lxml.etree._Element): El elemento raíz del XML de respuesta.
+            record_element (lxml.etree._Element): The OAI <record> XML element.
 
         Returns:
-            tuple: (list_of_records, resumption_token)
-                   list_of_records es una lista de diccionarios, cada uno representando un ítem.
-                   resumption_token es un string, o None si no hay más registros.
+            dict: A dictionary of extracted metadata, or None if essential info is missing.
         """
-        if xml_tree is None:
-            return [], None
-
-        # Primero, buscar errores OAI explícitos en la respuesta
-        oai_error_element = xml_tree.find('.//oai:error', namespaces=self.oai_namespaces)
-        if oai_error_element is not None:
-            error_code = oai_error_element.get('code', 'N/A')
-            error_message = oai_error_element.text.strip() if oai_error_element.text else 'No error message provided.'
-            self.logger.error(f"Error OAI recibido del servidor: Code='{error_code}', Message='{error_message}'")
-            if error_code == 'noRecordsMatch':
-                self.logger.info("El servidor OAI reportó 'noRecordsMatch' para la consulta actual.")
-            # Otros errores como 'badArgument', 'badResumptionToken', etc., también se manejarán aquí.
-            return [], None # No hay registros o token si hay un error
-
-        records = []
-        # Encontrar todos los elementos <record>
-        for record_element in xml_tree.findall('.//oai:record', namespaces=self.oai_namespaces):
-            header = record_element.find('oai:header', namespaces=self.oai_namespaces)
+        metadata = {}
+        try:
+            header = record_element.find(".//{http://www.openarchives.org/OAI/2.0/}header")
             if header is None:
-                self.logger.warning("Registro OAI encontrado sin elemento <header>. Saltando.")
-                continue
+                self.logger.warning("Record has no header. Skipping.")
+                return None
             
-            oai_identifier = header.find('oai:identifier', namespaces=self.oai_namespaces)
-            if oai_identifier is None or not oai_identifier.text:
-                self.logger.warning("Registro OAI encontrado sin oai:identifier. Saltando.")
-                continue
-            oai_id_text = oai_identifier.text.strip()
-
-            # Comprobar si el registro está marcado como eliminado
-            if header.get('status') == 'deleted':
-                self.logger.info(f"Registro OAI {oai_id_text} está marcado como 'deleted'. Se registrará como eliminado.")
-                self.db_manager.mark_oai_item_as_deleted(oai_id_text, self.oai_base_url)
-                continue # No procesar metadatos para registros eliminados
-
-            metadata_element = record_element.find('oai:metadata', namespaces=self.oai_namespaces)
-            if metadata_element is None:
-                self.logger.warning(f"Registro OAI {oai_id_text} sin elemento <metadata>. Saltando.")
-                continue
-            
-            # Asumimos oai_dc, pero podría ser parametrizable para otros formatos
-            dc_element = metadata_element.find(f'oai:{self.metadata_prefix}', namespaces=self.oai_namespaces)
-            if dc_element is None:
-                # Intenta buscar con el namespace dc directamente, algunos servidores lo ponen así
-                dc_element = metadata_element.find(f'dc:{self.metadata_prefix.split(':')[-1]}', namespaces=self.oai_namespaces)
-                if dc_element is None:
-                    self.logger.warning(f"Registro OAI {oai_id_text} sin elemento <{self.metadata_prefix}>. Metadata Prefix configurado: {self.metadata_prefix}")
-                    # Loguear los hijos de metadata_element para depuración
-                    # children_tags = [child.tag for child in metadata_element]
-                    # self.logger.debug(f"Hijos de <metadata> para {oai_id_text}: {children_tags}")
-                    continue
-
-            item_metadata = {
-                'oai_identifier': oai_id_text,
-                'repository_source_type': 'oai',
-                'oai_repository_url': self.oai_base_url # Guardar de qué repo OAI vino
-            }
-            
-            # Extraer metadatos Dublin Core (o el prefijo configurado)
-            for dc_field in dc_element:
-                # El tag viene con el namespace, ej: {http://purl.org/dc/elements/1.1/}title
-                field_name = dc_field.tag.split('}')[-1] # Obtener 'title' de '{namespace}title'
-                field_value = dc_field.text.strip() if dc_field.text else ''
-                
-                if field_value: # Solo agregar si hay valor
-                    if field_name in item_metadata: # Si el campo ya existe (ej. dc:subject múltiple)
-                        if not isinstance(item_metadata[field_name], list):
-                            item_metadata[field_name] = [item_metadata[field_name]] # Convertir a lista
-                        item_metadata[field_name].append(field_value)
-                    else:
-                        item_metadata[field_name] = field_value
-            
-            # Intentar obtener un enlace directo a la página del ítem si está en dc:identifier
-            # (a menudo hay varios dc:identifier, uno puede ser la URL de la página del ítem)
-            item_page_url_from_dc = None
-            if 'identifier' in item_metadata:
-                identifiers = item_metadata['identifier']
-                if not isinstance(identifiers, list):
-                    identifiers = [identifiers]
-                for ident in identifiers:
-                    if ident.startswith('http') and oai_id_text not in ident: # No tomar el propio OAI ID si es una URL
-                        # Heurística: tomar la primera URL HTTP/S que no sea el propio OAI ID como item_page_url
-                        # Esto puede necesitar refinamiento según el repositorio
-                        item_page_url_from_dc = ident
-                        break
-            item_metadata['item_page_url_from_oai'] = item_page_url_from_dc
-
-            records.append(item_metadata)
-            self.logger.debug(f"Registro OAI procesado: {oai_id_text}, Título: {item_metadata.get('title', 'N/A')[:50]}...")
-
-        # Encontrar el resumptionToken
-        resumption_token_element = xml_tree.find('.//oai:resumptionToken', namespaces=self.oai_namespaces)
-        resumption_token = None
-        if resumption_token_element is not None and resumption_token_element.text:
-            resumption_token = resumption_token_element.text.strip()
-            if not resumption_token: # Si el token está vacío, es como si no hubiera token
-                resumption_token = None
-                self.logger.info("ResumptionToken encontrado pero está vacío. Se considera fin de la lista.")
+            oai_id_element = header.find(self.oai_selectors['record_identifier'].replace('.//', '')) # Relative to header
+            if oai_id_element is not None and oai_id_element.text:
+                metadata['oai_identifier'] = oai_id_element.text.strip()
             else:
-                self.logger.info(f"ResumptionToken encontrado para la siguiente página: {resumption_token[:30]}...")
-        else:
-            self.logger.info("No se encontró ResumptionToken. Se asume fin de la lista de registros.")
-            
-        return records, resumption_token
+                self.logger.warning("Record has no OAI identifier. Skipping.")
+                return None # OAI identifier is crucial
 
-    def harvest_repository(self, oai_repo_config):
+            # Extract Dublin Core fields (or other configured metadata fields)
+            meta_section = record_element.find(".//{http://www.openarchives.org/OAI/2.0/}metadata")
+            if meta_section is None:
+                self.logger.warning(f"Record {metadata['oai_identifier']} has no metadata section. Skipping.")
+                return metadata # Return OAI ID at least
+
+            # Example for DC fields, adapt if using other metadataPrefix
+            dc_fields_map = {
+                'title': self.oai_selectors.get('dc_title'),
+                'authors': self.oai_selectors.get('dc_creator'), # Can be multiple
+                'keywords': self.oai_selectors.get('dc_subject'), # Can be multiple
+                'abstract': self.oai_selectors.get('dc_description'),
+                'publication_date': self.oai_selectors.get('dc_date'),
+                'publisher': self.oai_selectors.get('dc_publisher'),
+                'type': self.oai_selectors.get('dc_type'),
+                'format': self.oai_selectors.get('dc_format'),
+                'dc_identifier_list': self.oai_selectors.get('dc_identifier'), # List of all identifiers (URLs, DOIs, etc.)
+                'language': self.oai_selectors.get('dc_language')
+            }
+
+            for key, selector in dc_fields_map.items():
+                if not selector: continue
+                # Use .// to search anywhere within the meta_section for these specific DC tags
+                elements = meta_section.xpath(selector)
+                if elements:
+                    # For fields that can have multiple values (authors, keywords, dc_identifier_list)
+                    if key in ['authors', 'keywords', 'dc_identifier_list']:
+                        metadata[key] = [el.text.strip() for el in elements if el.text and el.text.strip()]
+                    else: # For single value fields, take the first non-empty one
+                        for el in elements:
+                            if el.text and el.text.strip():
+                                metadata[key] = el.text.strip()
+                                break
+            
+            # Try to find a direct item page URL or DOI from dc_identifier_list
+            # This is a common pattern for OAI records.
+            item_page_url_found = None
+            doi_found = None
+            if 'dc_identifier_list' in metadata:
+                for ident in metadata['dc_identifier_list']:
+                    if ident.startswith('http://') or ident.startswith('https://'):
+                        if not item_page_url_found and '/handle/' in ident: # DSpace handle URLs are good candidates
+                            item_page_url_found = ident
+                        elif not item_page_url_found and '/jspui/' in ident: # Another DSpace pattern
+                            item_page_url_found = ident
+                        elif not item_page_url_found and '.html' in ident.lower(): # Generic html page
+                            item_page_url_found = ident
+                        # Prioritize specific patterns before generic http, if multiple http links exist
+                    if ident.lower().startswith('doi:') or (ident.startswith('10.') and '/' in ident):
+                        doi_found = ident.lower().replace('doi:','').strip()
+                
+                if item_page_url_found: metadata['item_page_url_from_oai'] = item_page_url_found
+                if doi_found: metadata['doi_from_oai'] = doi_found
+                # pdf_url_harvested might also come from dc_identifier if it ends with .pdf
+                for ident in metadata['dc_identifier_list']:
+                    if ident.lower().endswith('.pdf'):
+                        metadata['pdf_url_harvested'] = ident
+                        break # Take the first one
+
+            # Also check dc:format for PDF indication
+            if metadata.get('format', '').lower() == 'application/pdf' and 'pdf_url_harvested' not in metadata and item_page_url_found:
+                # This is tricky. OAI usually doesn't give direct PDF links if format is PDF.
+                # It implies the main identifier *is* the PDF, or one of the identifiers is.
+                # We primarily rely on HTML scraping for PDF links unless dc_identifier gives a direct one.
+                self.logger.debug(f"Record {metadata['oai_identifier']} format is PDF, but no direct PDF URL in identifiers. Will need HTML processing.")
+
+            return metadata
+        except Exception as e:
+            oai_id = metadata.get('oai_identifier', 'UNKNOWN_OAI_ID')
+            self.logger.error(f"Error parsing record {oai_id}: {e}", exc_info=False)
+            # Log the problematic record's XML for debugging
+            try:
+                problematic_xml = etree.tostring(record_element, pretty_print=True).decode('utf-8')[:500]
+                self.logger.debug(f"Problematic record XML snippet: {problematic_xml}...")
+            except Exception as log_e:
+                self.logger.error(f"Could not serialize problematic record element: {log_e}")
+            return None # Return None if parsing fails for a record
+
+    def harvest_repository(self, repo_config):
         """
-        Cosecha todos los registros de un repositorio OAI configurado.
+        Harvests all records from a single OAI-PMH repository based on config.
 
         Args:
-            oai_repo_config (dict): Configuración específica para este repositorio OAI,
-                                    debe contener 'url' y opcionalmente 'name', 'set_spec', etc.
+            repo_config (dict): Configuration for the repository (name, base_url, set_spec, etc.).
+
+        Returns:
+            int: Count of new items found and added/updated in the DB from this repository.
         """
-        self.oai_base_url = oai_repo_config.get('url')
-        repo_name = oai_repo_config.get('name', self.oai_base_url)
-        repo_set_spec = oai_repo_config.get('set_spec', self.set_spec) # Priorizar config de repo
-        max_records_this_repo = oai_repo_config.get('max_records', self.max_records_to_fetch_total)
-
-        if not self.oai_base_url:
-            self.logger.error(f"No se proporcionó URL para el repositorio OAI: {repo_name}")
-            return 0, 0, 0 # fetched, processed, failed
-
-        self.logger.info(f"--- Iniciando cosecha OAI para el repositorio: {repo_name} ({self.oai_base_url}) ---")
-        if max_records_this_repo is not None:
-            self.logger.info(f"Límite máximo de registros a obtener para este repositorio: {max_records_this_repo}")
-        if repo_set_spec:
-            self.logger.info(f"Usando OAI setSpec: {repo_set_spec}")
-        if self.from_date or self.until_date:
-             self.logger.info(f"Filtrando por fecha: from={self.from_date or 'N/A'}, until={self.until_date or 'N/A'}")
-
-        params = {
-            'verb': 'ListRecords',
-            'metadataPrefix': self.metadata_prefix
-        }
-        if repo_set_spec: params['set'] = repo_set_spec
-        if self.from_date: params['from'] = self.from_date
-        if self.until_date: params['until'] = self.until_date
+        repo_name = repo_config.get('name', 'UnknownRepo')
+        base_url = repo_config.get('base_url')
+        set_spec = repo_config.get('set_spec') # Optional
+        metadata_prefix = repo_config.get('metadata_prefix', OAI_METADATA_PREFIX_DC)
         
-        total_records_fetched_this_repo = 0
-        total_records_processed_successfully = 0
-        total_records_failed_to_process = 0
-        page_num = 1
+        if not base_url or not self.db_manager:
+            self.logger.error(f"Cannot harvest for {repo_name}: base_url or db_manager is missing.")
+            return 0
+
+        self.logger.info(f"Starting OAI harvest for repository: {repo_name} ({base_url})")
+        total_records_fetched_for_repo = 0
+        new_items_added_for_repo = 0
+        resumption_token = None
+        first_request = True
 
         while True:
-            self.logger.info(f"Cosechando página {page_num} de {repo_name}...")
-            if max_records_this_repo is not None and total_records_fetched_this_repo >= max_records_this_repo:
-                self.logger.info(f"Se alcanzó el límite de {max_records_this_repo} registros para {repo_name}. Deteniendo cosecha.")
-                break
-
-            xml_response_tree = self._make_oai_request(params)
-            if xml_response_tree is None:
-                self.logger.error(f"Fallo al obtener o parsear la página {page_num} de {repo_name}. Abortando cosecha para este repositorio.")
-                break # Salir del bucle si la petición falla catastróficamente
-
-            records, resumption_token = self._parse_oai_response(xml_response_tree)
-            
-            if not records and not resumption_token:
-                 # Podría ser un error OAI como noRecordsMatch o un error de parseo que ya fue logueado
-                oai_error_element = xml_response_tree.find('.//oai:error', namespaces=self.oai_namespaces)
-                if oai_error_element is not None and oai_error_element.get('code') == 'noRecordsMatch':
-                    self.logger.info(f"No se encontraron más registros que coincidan con los criterios en {repo_name} (noRecordsMatch).")
-                elif not records:
-                    self.logger.info(f"No se encontraron registros en la página {page_num} de {repo_name} y no hay resumption token. Asumiendo fin de la lista.")
-                break # Salir si no hay registros ni token
-            
-            num_fetched_this_page = len(records)
-            total_records_fetched_this_repo += num_fetched_this_page
-            self.logger.info(f"Se obtuvieron {num_fetched_this_page} registros de la página {page_num} de {repo_name}. Total para este repo: {total_records_fetched_this_repo}")
-
-            for item_data in records:
-                if max_records_this_repo is not None and total_records_processed_successfully >= max_records_this_repo:
-                    # Este chequeo es para el caso en que el límite se alcance a mitad de página
-                    self.logger.info(f"Se alcanzó el límite de {max_records_this_repo} registros procesados para {repo_name} (a mitad de página). Deteniendo.")
-                    resumption_token = None # Forzar salida del bucle while
-                    break 
-
-                try:
-                    # self.logger.debug(f"Procesando OAI item: {item_data.get('oai_identifier')}") # Muy verboso
-                    # El item_id de la BD se genera o se obtiene dentro de get_or_create_item
-                    item_id, created = self.db_manager.get_or_create_item(
-                        oai_identifier=item_data['oai_identifier'],
-                        repository_source=repo_name, # Usar el nombre del repo OAI como fuente
-                        item_page_url=item_data.get('item_page_url_from_oai') # Puede ser None
-                    )
-                    if created:
-                        self.logger.info(f"Nuevo ítem OAI creado en BD con ID {item_id} para OAI ID: {item_data['oai_identifier']}")
-                    else:
-                        self.logger.info(f"Ítem OAI existente encontrado en BD con ID {item_id} para OAI ID: {item_data['oai_identifier']}")
-                    
-                    # Guardar todos los metadatos OAI en la tabla de metadatos
-                    # y actualizar el estado del ítem
-                    self.db_manager.log_item_metadata(item_id, item_data, source_type='oai')
-                    self.db_manager.update_item_status(item_id, 'pending_pdf_link') # Estado inicial después de OAI
-                    total_records_processed_successfully += 1
-                except Exception as e:
-                    self.logger.error(f"Error procesando/guardando en BD el ítem OAI {item_data.get('oai_identifier', 'ID_DESCONOCIDO')}: {e}")
-                    total_records_failed_to_process += 1
-            
+            params = {
+                'verb': OAI_VERB_LIST_RECORDS
+            }
             if resumption_token:
-                # Para la siguiente petición, solo se necesita el resumptionToken
-                params = {'verb': 'ListRecords', 'resumptionToken': resumption_token}
-                page_num += 1
+                params['resumptionToken'] = resumption_token
+                first_request = False # Not the first request anymore
+            else: # Only add metadataPrefix and set on the initial request
+                params['metadataPrefix'] = metadata_prefix
+                if set_spec:
+                    params['set'] = set_spec
+            
+            xml_tree = self._make_oai_request(base_url, params)
+            if xml_tree is None:
+                self.logger.error(f"Failed to fetch or critical OAI error for {repo_name} (params: {params}). Aborting harvest for this repository.")
+                break # Abort for this repo if a request fails critically
+
+            records_in_batch = xml_tree.xpath(self.oai_selectors.get('record', './/record')) # Default XPath if not in selectors
+            self.logger.info(f"Retrieved {len(records_in_batch)} records in this batch from {repo_name}.")
+
+            if not records_in_batch and first_request:
+                # Check again for noRecordsMatch specifically, _make_oai_request might have logged it
+                error_elements = xml_tree.xpath(self.oai_selectors.get('oai_error', './/error'))
+                if any(err.get('code') == 'noRecordsMatch' for err in error_elements):
+                    self.logger.info(f"No records match the initial criteria for {repo_name}. Harvest for this repo ends.")
+                else:
+                    self.logger.warning(f"No records found in the first batch from {repo_name}, but no explicit 'noRecordsMatch' error. Check OAI endpoint or config.")
+                break # No records to process
+
+            for record_element in records_in_batch:
+                if total_records_fetched_for_repo >= self.max_records_per_repo:
+                    self.logger.info(f"Reached max_records_oai_per_repo ({self.max_records_per_repo}) for {repo_name}. Stopping harvest for this repo.")
+                    break # Break from processing records in batch
+                
+                parsed_data = self._parse_record(record_element)
+                if parsed_data and 'oai_identifier' in parsed_data:
+                    total_records_fetched_for_repo += 1
+                    item_id, is_new = self.db_manager.get_or_create_item(
+                        repository_source=repo_name, # Use the configured repo name as source
+                        oai_identifier=parsed_data['oai_identifier'],
+                        item_page_url=parsed_data.get('item_page_url_from_oai'), # May be None
+                        initial_status='pending_pdf_link' # Items from OAI need PDF link extraction from item page
+                    )
+                    if item_id:
+                        if is_new:
+                            new_items_added_for_repo += 1
+                            self.logger.info(f"New OAI item: ID {item_id}, OAI_ID: {parsed_data['oai_identifier']} from {repo_name}")
+                        else:
+                            self.logger.info(f"Existing OAI item: ID {item_id}, OAI_ID: {parsed_data['oai_identifier']} from {repo_name}. Will check/update.")
+                        
+                        # Log all extracted metadata
+                        self.db_manager.log_item_metadata(
+                            item_id=item_id,
+                            title=parsed_data.get('title'),
+                            publication_date=parsed_data.get('publication_date'),
+                            abstract=parsed_data.get('abstract'),
+                            doi=parsed_data.get('doi_from_oai'),
+                            authors=parsed_data.get('authors'),
+                            keywords=parsed_data.get('keywords'),
+                            pdf_url_harvested=parsed_data.get('pdf_url_harvested') # If found directly in OAI identifiers
+                        )
+                        # If a direct PDF URL was found in OAI, update status
+                        if parsed_data.get('pdf_url_harvested'):
+                            self.db_manager.update_item_status(item_id, 'pending_pdf_download')
+                else:
+                    self.logger.warning(f"Could not parse a record or missing OAI ID from {repo_name}. Record skipped.")
+            
+            if total_records_fetched_for_repo >= self.max_records_per_repo:
+                break # Break from while loop (pagination)
+
+            # Check for resumptionToken
+            token_elements = xml_tree.xpath(self.oai_selectors.get('resumption_token', './/resumptionToken'))
+            if token_elements and token_elements[0].text and token_elements[0].text.strip():
+                resumption_token = token_elements[0].text.strip()
+                self.logger.info(f"Got resumptionToken: '{resumption_token[:20]}...' for {repo_name}")
+                # Check if the token is empty or signals end (some OAI servers send empty token with attributes)
+                # Example: <resumptionToken completeListSize="123" cursor="0"></resumptionToken> (empty text means end)
+                if not resumption_token: # Explicitly empty text means end
+                    self.logger.info(f"Empty resumptionToken text received. Assuming end of list for {repo_name}.")
+                    break
+                time.sleep(self.request_delay) # Be polite to the server
             else:
-                self.logger.info(f"No hay más ResumptionToken para {repo_name}. Fin de la cosecha OAI para este repositorio.")
-                break # Salir del bucle while
+                self.logger.info(f"No resumptionToken found. End of harvest for {repo_name}.")
+                break # No token, end of list
         
-        self.logger.info(f"--- Cosecha OAI finalizada para: {repo_name} ---")
-        self.logger.info(f"Total registros obtenidos de {repo_name}: {total_records_fetched_this_repo}")
-        self.logger.info(f"Total registros procesados y guardados exitosamente de {repo_name}: {total_records_processed_successfully}")
-        self.logger.info(f"Total registros que fallaron al procesar/guardar de {repo_name}: {total_records_failed_to_process}")
+        self.logger.info(f"Finished OAI harvest for {repo_name}. Fetched {total_records_fetched_for_repo} records in total. Added {new_items_added_for_repo} new items to DB.")
+        return new_items_added_for_repo
+
+    def run_harvest(self):
+        """
+        Runs the OAI harvesting process for all configured repositories.
+        """
+        if not self.oai_repositories:
+            self.logger.info("No OAI repositories configured. Skipping OAI harvesting.")
+            return 0
         
-        return total_records_fetched_this_repo, total_records_processed_successfully, total_records_failed_to_process
+        if not self.db_manager:
+            self.logger.error("Database manager not available. OAI harvesting cannot proceed.")
+            return 0
 
+        self.logger.info(f"Starting OAI harvesting for {len(self.oai_repositories)} repositories.")
+        total_new_items_across_all_repos = 0
+        for repo_conf in self.oai_repositories:
+            total_new_items_across_all_repos += self.harvest_repository(repo_conf)
+        
+        self.logger.info(f"OAI harvesting phase completed. Total new items added from all OAI sources: {total_new_items_across_all_repos}")
+        return total_new_items_across_all_repos
 
-# Ejemplo de uso (requiere mocks o una BD y config reales)
+# Example Usage (Illustrative)
 if __name__ == '__main__':
-    # --- Mockups para prueba --- 
-    class MockLogger:
-        def info(self, msg): print(f"INFO: {msg}")
-        def error(self, msg): print(f"ERROR: {msg}")
-        def warning(self, msg): print(f"WARNING: {msg}")
-        def debug(self, msg): print(f"DEBUG: {msg}")
+    # Setup basic logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    example_logger = logging.getLogger("OAIHarvesterBRExample")
 
-    class MockDBManager:
-        def get_or_create_item(self, oai_identifier, repository_source, item_page_url=None):
-            print(f"DB: Get/Create item OAI ID {oai_identifier} from {repository_source}")
-            return f"fake_item_id_for_{oai_identifier.replace(':','_')}", True # Simula creación
-        def log_item_metadata(self, item_id, metadata_dict, source_type):
-            print(f"DB: Logged metadata for item {item_id} (source: {source_type}), Title: {metadata_dict.get('title', 'N/A')[:30]}")
-        def update_item_status(self, item_id, status):
-            print(f"DB: Updated status for item {item_id} to {status}")
-        def mark_oai_item_as_deleted(self, oai_identifier, repo_url):
-            print(f"DB: Marked OAI item {oai_identifier} from {repo_url} as deleted.")
-
-    mock_logger = MockLogger()
-    mock_db_manager = MockDBManager()
-    mock_config = {
-        'oai_metadata_prefix': 'oai_dc',
-        'oai_request_timeout': 10,
-        'oai_max_retries': 1,
-        'oai_retry_delay': 1,
-        'user_agent': 'TestHarvester/1.0',
-        # 'oai_max_records_total_per_repo': 5 # Descomentar para probar límite
-    }
-    # --- Fin Mockups ---
-
-    harvester = OAIHarvesterBR(mock_config, mock_logger, mock_db_manager)
-
-    # --- Prueba con un repositorio OAI público (ej. de prueba de OCLC o similar) ---
-    # Reemplazar con URLs OAI reales y válidas para probar
-    # Ejemplo: Repositorio de prueba de OCLC (puede tener pocos registros o cambiar)
-    # oai_test_repo_config = {
-    #     'name': 'OCLC Test OAI Repo',
-    #     'url': 'http://purl.oclc.org/OAI/2.0/test' # Este es un ejemplo, puede no funcionar siempre
-    #     # 'set_spec': 'testSet' # Ejemplo de set
-    # }
-
-    # Ejemplo con un repositorio que podría tener el error "noRecordsMatch" si no hay nada reciente
-    # oai_test_repo_config_bci = {
-    #     'name': 'Biblioteca Digital BCI Chile (Ejemplo)',
-    #     'url': 'https://bibliotecadigital.bci.cl/oai/request' # Endpoint real, pero la cosecha dependerá de filtros
-    # }
-
-    # IMPORTANTE: Para una prueba real, necesitas un endpoint OAI que sepas que funciona y tiene datos.
-    # El siguiente es un endpoint de prueba conocido pero puede no tener siempre registros visibles sin 'set' o con 'oai_dc'
-    oai_dspace_test_repo = {
-        'name': 'DSpace Demo OAI',
-        'url': 'https://demo.dspace.org/oai/request' # Un demo de DSpace
-        # 'max_records': 10 # Para limitar la prueba
+    # Mock configuration
+    mock_config_data = {
+        'oai_repositories': [
+            {
+                'name': 'alice_test',
+                'base_url': 'https://www.alice.cnptia.embrapa.br/oai/request',
+                # 'set_spec': 'com_123456789_1', # Example set, if needed
+                'metadata_prefix': 'oai_dc'
+            }
+            # Add more repositories if needed, e.g., Infoteca-e if it has OAI
+            # {
+            #     'name': 'infoteca_test',
+            #     'base_url': 'https://www.infoteca.cnptia.embrapa.br/infoteca/oai', # Hypothetical URL
+            #     'metadata_prefix': 'oai_dc'
+            # }
+        ],
+        'oai_request_timeout': 30,
+        'oai_request_delay_seconds': 2,
+        'max_records_oai_per_repo': 15, # Limit for example run
+        'user_agent': 'TestHarvester/1.0'
     }
 
-    mock_logger.info("--- Iniciando prueba del OAIHarvesterBR ---")
-    # fetched, processed, failed = harvester.harvest_repository(oai_test_repo_config_bci)
-    fetched, processed, failed = harvester.harvest_repository(oai_dspace_test_repo)
-    
-    mock_logger.info(f"Resultado de la cosecha de prueba: Obtenidos={fetched}, Procesados={processed}, Fallidos={failed}")
-    mock_logger.info("--- Prueba del OAIHarvesterBR finalizada ---")
-    mock_logger.info("Si la URL de prueba es válida y tiene registros, deberías ver actividad de 'DB: ...' arriba.")
-    mock_logger.info("Recuerda que los metadatos reales dependen del contenido del repositorio OAI.")
+    # Mock selectors (can be loaded from a YAML file in a real scenario)
+    mock_selectors_data = {
+        'oai_selectors': { # These are often standard, but can be customized if needed
+            'record': ".//{http://www.openarchives.org/OAI/2.0/}record",
+            'record_identifier': ".//{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}identifier",
+            'dc_title': ".//{http://purl.org/dc/elements/1.1/}title",
+            'dc_creator': ".//{http://purl.org/dc/elements/1.1/}creator",
+            'dc_identifier': ".//{http://purl.org/dc/elements/1.1/}identifier",
+            'resumption_token': ".//{http://www.openarchives.org/OAI/2.0/}resumptionToken"
+            # Add other DC fields as needed following the pattern
+        }
+    }
+
+    example_logger.info("Initializing OAIHarvesterBR for example...")
+    harvester = OAIHarvesterBR(
+        config=mock_config_data, 
+        logger=example_logger, 
+        db_manager=MockDBManager(), # Using mock DB for this example
+        selectors_dict=mock_selectors_data
+    )
+
+    example_logger.info("Starting example OAI harvest run...")
+    # new_items = harvester.run_harvest()
+    # example_logger.info(f"Example OAI harvest finished. Found {new_items} new items.")
+    example_logger.info("Example harvest call is commented out to prevent actual web requests during non-interactive tests.")
+    example_logger.info("To run a real test against Alice, uncomment the run_harvest() call.")
+    example_logger.info("Make sure the base_url for Alice is correct and it's accessible.")
+    pass
