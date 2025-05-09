@@ -1,0 +1,53 @@
+# Selectores XPath para extraer metadatos y enlaces PDF de las páginas HTML de repositorios DSpace (y otros)
+# Adaptado para el scraper de Brasil (BR)
+
+pdf_link_selectors:
+  # Selector general para enlaces PDF en páginas de ítems (DSpace)
+  - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Fichero') or contains(text(),'File')]]//div[@class='page-link-wrapper']/a/@href"
+  - "//a[contains(@href, '.pdf') and (contains(lower-case(text()), 'pdf') or contains(lower-case(text()), 'texto completo') or contains(lower-case(text()), 'full text'))]/@href"
+  - "//a[.//img[contains(@alt, 'pdf') or contains(@src, 'pdf_icon')]]/@href" # Enlace PDF que contiene una imagen de icono PDF
+  - "//div[@class='file-link']/a[contains(@href, '.pdf')]/@href"
+
+metadata_selectors:
+  # Selectores para metadatos individuales. Estos son ejemplos y pueden necesitar ajustes.
+  # La fuente primaria de metadatos debería ser OAI si está disponible.
+  title:
+    - "//meta[@name='DC.title']/@content"
+    - "//meta[@name='citation_title']/@content"
+    - "//h1[contains(@class, 'page-header')]/text()"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Título') or contains(text(),'Title')]]//div[2]//text()"
+  author:
+    - "//meta[@name='DC.creator']/@content"
+    - "//meta[@name='citation_author']/@content"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Autor') or contains(text(),'Author')]]//div[2]//a/text()"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Autor') or contains(text(),'Author')]]//div[2]//text()"
+  publication_date:
+    - "//meta[@name='DCTERMS.issued']/@content"
+    - "//meta[@name='citation_publication_date']/@content"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Fecha de publicación') or contains(text(),'Publication date')]]//div[2]//text()"
+  abstract:
+    - "//meta[@name='DCTERMS.abstract']/@content"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Resumen') or contains(text(),'Abstract')]]//div[2]//text()"
+  keywords:
+    - "//meta[@name='DC.subject']/@content"
+    - "//meta[@name='citation_keywords']/@content"
+    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Palabras clave') or contains(text(),'Keywords')]]//div[2]//text()"
+  doi:
+    - "//meta[@name='citation_doi']/@content"
+    - "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/text()"
+    - "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/@href"
+  # ... otros metadatos que se puedan necesitar
+
+# Selectores para resultados de búsqueda web (si se implementa)
+web_search_results:
+  item_container: "//div[contains(@class, 'search-result-item')]" # Contenedor de cada resultado
+  item_link: ".//h3/a/@href"  # Enlace a la página del ítem, relativo al contenedor
+  item_title: ".//h3/a/text()" # Título del ítem
+  next_page_link: "//a[contains(text(), 'Próxima') or contains(text(), 'Next')]/@href" # Enlace a la siguiente página de resultados
+
+# Selectores para OAI Harvester (Placeholder - OAI no usa selectores HTML de esta manera)
+oai_selectors:
+  # Los datos OAI se parsean de XML, no con selectores CSS/XPath de la misma forma que el HTML.
+  # Esta sección es un placeholder o para referencia si alguna vez se necesitara
+  # parsear información HTML relacionada con el flujo OAI.
+  placeholder: "No aplica directamente para OAI-PMH XML parsing"
