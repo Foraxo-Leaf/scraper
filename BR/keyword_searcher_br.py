@@ -1,462 +1,479 @@
-import time
 import logging
-from urllib.parse import urlencode, urljoin, quote_plus
+import time
+import re
+from urllib.parse import urlencode, urljoin
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-# from webdriver_manager.chrome import ChromeDriverManager # Opcional, para gestión automática del driver
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 
-from lxml import html # Para parsear el HTML obtenido por Selenium
+from lxml import html
+
+# Mock classes for testing if real dependencies are not available or for simple examples
+class MockLogger:
+    def info(self, msg): print(f"INFO: {msg}")
+    def warning(self, msg): print(f"WARNING: {msg}")
+    def error(self, msg, exc_info=False): print(f"ERROR: {msg}")
+    def debug(self, msg): print(f"DEBUG: {msg}")
+
+class MockDBManager:
+    def get_or_create_item(self, repository_source, oai_identifier=None, item_page_url=None, initial_status='pending_html_processing'):
+        print(f"DB: Get/Create item for source={repository_source}, page_url={item_page_url}")
+        # Simulate returning a new item ID and that it's new
+        return (int(time.time() * 1000) % 100000, True) 
+    def update_item_status(self, item_id, status):
+        print(f"DB: Update item_id={item_id} to status={status}")
+    def log_item_metadata(self, item_id, title=None, pdf_url_harvested=None, **kwargs):
+        print(f"DB: Log metadata for item_id={item_id}, title={title}, pdf_url={pdf_url_harvested}")
 
 class KeywordSearcherBR:
     """
-    Clase para buscar publicaciones por palabras clave en portales web,
-    adaptada para el scraper de Brasil (BR).
-    Utiliza Selenium para la navegación y obtención de HTML si es necesario.
+    Performs keyword searches on the Embrapa main portal (or other configured web source)
+    and extracts links to item detail pages.
     """
 
-    def __init__(self, config, logger, db_manager, downloader, selectors_dict):
+    def __init__(self, config, logger=None, db_manager=None, downloader=None, selectors_dict=None):
         """
-        Inicializa el KeywordSearcherBR.
+        Initializes the KeywordSearcherBR.
 
         Args:
-            config (dict): Configuración del scraper.
-            logger (logging.Logger): Instancia del logger.
-            db_manager (DatabaseManagerBR): Instancia del gestor de base de datos.
-            downloader (ResourceDownloaderBR): Instancia para descargar recursos.
-            selectors_dict (dict): Diccionario con los selectores XPath/CSS.
+            config (dict): Configuration dictionary.
+            logger (logging.Logger, optional): Logger instance.
+            db_manager (DatabaseManagerBR, optional): Database manager instance.
+            downloader (ResourceDownloaderBR, optional): Resource downloader for HTML (not used if Selenium is primary).
+            selectors_dict (dict, optional): Dictionary of selectors, typically from selectors.yaml.
         """
         self.config = config
-        self.logger = logger if logger else logging.getLogger(__name__)
+        self.logger = logger or logging.getLogger(__name__)
         self.db_manager = db_manager
-        self.downloader = downloader # Podría usarse para descargar snapshots HTML de resultados
-        self.selectors_dict = selectors_dict.get('web_search_results', {})
-
-        self.search_config = self.config.get('search_config', {})
-        self.base_search_url = self.search_config.get('base_url')
-        self.query_param = self.search_config.get('query_param', 'termo') # ej. 'q', 'query', 'palavras_chave', 'termo'
-        self.page_param = self.search_config.get('page_param', 'pagina') # ej. 'page', 'p', 'start', 'pagina'
-        self.results_per_page = self.search_config.get('results_per_page', 20) # Estimado o fijo
-        self.max_pages_to_search = self.search_config.get('max_pages_per_keyword', 5)
-        self.max_items_to_process = self.config.get('max_items_keyword_search', 100)
+        self.downloader = downloader # May not be used if Selenium fetches directly
         
-        self.use_selenium = self.search_config.get('use_selenium', True) # Si el sitio requiere JS
-        self.selenium_timeout = self.search_config.get('selenium_page_load_timeout', 30)
-        self.selenium_driver_path = self.config.get('selenium_chrome_driver_path', None) # ej. '/usr/bin/chromedriver'
-        self.selenium_implicit_wait = self.search_config.get('selenium_implicit_wait', 10)
-        self.selenium_wait_for_element_xpath = self.selectors_dict.get('item_container', None) # Esperar a que los contenedores de items carguen
-        self.search_delay_between_pages = self.search_config.get('delay_between_search_pages', 3) # segundos
-        self.user_agent = self.config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+        self.search_config = config.get('search_config', {})
+        self.base_search_url = self.search_config.get('base_url')
+        self.search_query_param = self.search_config.get('query_param', 'q') # Common query param
+        self.pagination_param = self.search_config.get('pagination_param', 'page') # Common pagination param
+        self.start_page_number = self.search_config.get('start_page_number', 0) # Or 1, depends on site
+        self.max_search_pages = self.search_config.get('max_search_pages_per_keyword', 5)
+        self.search_results_per_page = self.search_config.get('results_per_page', 10) # Typical default
+        self.search_delay_seconds = self.search_config.get('search_delay_seconds', 5)
+        self.selenium_timeout = self.search_config.get('selenium_timeout', 30)
+        self.webdriver_path = config.get('webdriver_path', 'chromedriver') # Or path to geckodriver etc.
+        self.user_agent = config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
 
-        self.driver = None # Se inicializará si se usa Selenium
+        if selectors_dict is None:
+            self.logger.warning("Selectors dictionary not provided to KeywordSearcherBR. Parsing will likely fail.")
+            self.selectors = {}
+        else:
+            self.selectors = selectors_dict.get('web_search_results_selectors', {})
+            if not self.selectors:
+                 self.logger.warning("'web_search_results_selectors' not found or empty in selectors_dict.")
+
+        self.item_container_xpath = self.selectors.get('item_container')
+        self.title_xpath = self.selectors.get('title')
+        self.link_to_item_page_xpath = self.selectors.get('link_to_item_page')
+        self.next_page_link_xpath = self.selectors.get('next_page_link')
+
+        if not all([self.item_container_xpath, self.title_xpath, self.link_to_item_page_xpath]):
+            self.logger.error("Critical search selectors (item_container, title, link_to_item_page) are missing. Keyword searching will be impaired.")
+
+        self.driver = None
 
     def _configure_webdriver_options(self):
-        """Configura las opciones para el WebDriver de Chrome."""
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless") # Ejecutar en modo headless
-        options.add_argument("--no-sandbox") # Necesario para ejecutar como root en algunos entornos (ej. Docker)
-        options.add_argument("--disable-dev-shm-usage") # Superar recursos limitados
-        options.add_argument("--disable-gpu") # A veces necesario en headless
+        """Configures Chrome options for Selenium WebDriver."""
+        options = ChromeOptions()
+        options.add_argument("--headless") # Run headless
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
         options.add_argument(f"user-agent={self.user_agent}")
-        options.add_argument("--lang=pt-BR,pt;q=0.9,es;q=0.8,en;q=0.7") # Preferir portugués
         options.add_argument("--window-size=1920x1080")
-        # options.add_experimental_option('excludeSwitches', ['enable-logging']) # Para limpiar logs de consola
+        # options.add_experimental_option("excludeSwitches", ["enable-automation"]) # More stealth
+        # options.add_experimental_option('useAutomationExtension', False)
+        # options.add_argument('--disable-blink-features=AutomationControlled')
         return options
 
     def _init_webdriver(self):
-        """Inicializa el WebDriver de Selenium."""
-        if not self.use_selenium:
-            self.logger.info("Selenium no está habilitado para la búsqueda por palabra clave.")
-            return False
-        
+        """Initializes the Selenium WebDriver."""
         if self.driver:
-            return True # Ya inicializado
-
-        self.logger.info("Inicializando WebDriver de Selenium (Chrome)...")
+            return True
         try:
             options = self._configure_webdriver_options()
-            if self.selenium_driver_path:
-                service = ChromeService(executable_path=self.selenium_driver_path)
+            # For now, assuming ChromeDriver. Could be made configurable for Firefox (geckodriver) etc.
+            # If webdriver_path is just 'chromedriver', it needs to be in PATH.
+            # Otherwise, it should be the full path to the executable.
+            if self.webdriver_path and self.webdriver_path != 'chromedriver':
+                 # Using Service object is the modern way
+                from selenium.webdriver.chrome.service import Service as ChromeService
+                service = ChromeService(executable_path=self.webdriver_path)
                 self.driver = webdriver.Chrome(service=service, options=options)
             else:
-                # Intentar usar webdriver_manager si está disponible y configurado (no por defecto aquí)
-                # self.driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
-                # O asumir que chromedriver está en el PATH
-                self.logger.info("No se especificó selenium_chrome_driver_path. Asumiendo que chromedriver está en el PATH.")
-                self.driver = webdriver.Chrome(options=options)
+                self.driver = webdriver.Chrome(options=options) # Assumes chromedriver is in PATH
             
-            self.driver.implicitly_wait(self.selenium_implicit_wait)
             self.driver.set_page_load_timeout(self.selenium_timeout)
-            self.logger.info("WebDriver de Selenium inicializado exitosamente.")
+            self.logger.info("Selenium WebDriver initialized successfully.")
             return True
         except WebDriverException as e:
-            self.logger.error(f"Error inicializando WebDriver de Selenium: {e}")
-            self.logger.error("Asegúrate de que ChromeDriver esté instalado y en el PATH, o especifica 'selenium_chrome_driver_path' en la config.")
+            self.logger.error(f"Failed to initialize Selenium WebDriver: {e}. Ensure WebDriver (e.g., chromedriver) is correctly installed and in PATH or path is configured.")
             self.driver = None
             return False
         except Exception as e:
-            self.logger.error(f"Error inesperado inicializando WebDriver: {e}")
+            self.logger.error(f"An unexpected error occurred during WebDriver initialization: {e}")
             self.driver = None
             return False
 
     def _get_html_with_selenium(self, url):
-        """
-        Obtiene el contenido HTML de una URL usando Selenium.
-        """
-        if not self.driver:
-            if not self._init_webdriver(): # Intenta inicializar si aún no lo está
-                return None
-        
-        self.logger.info(f"Navegando a (Selenium): {url}")
+        """Fetches HTML content of a URL using Selenium, handling dynamic content."""
+        if not self.driver and not self._init_webdriver():
+            return None
         try:
+            self.logger.debug(f"Fetching URL with Selenium: {url}")
             self.driver.get(url)
-            # Esperar a que un elemento clave de los resultados esté presente (si se configuró)
-            if self.selenium_wait_for_element_xpath:
-                WebDriverWait(self.driver, self.selenium_timeout).until(
-                    EC.presence_of_all_elements_located((By.XPATH, self.selenium_wait_for_element_xpath))
-                )
-                self.logger.debug(f"Elemento esperado ({self.selenium_wait_for_element_xpath}) encontrado en la página.")
-            else: # Espera genérica si no hay selector específico
-                time.sleep(self.config.get('selenium_default_load_wait', 5)) 
-
-            html_content = self.driver.page_source
-            self.logger.info(f"HTML obtenido con Selenium desde {url} (longitud: {len(html_content)})")
-            return html_content
+            # Wait for a general condition, e.g., body tag to be present, or a specific element for search results
+            WebDriverWait(self.driver, self.selenium_timeout).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            # Optionally, add a small delay for JavaScript to execute if WebDriverWait isn't enough
+            # time.sleep(2) # Use with caution, prefer explicit waits
+            return self.driver.page_source
         except TimeoutException:
-            self.logger.error(f"Timeout esperando a que cargue la página o el elemento en (Selenium): {url}")
+            self.logger.error(f"Timeout occurred while loading page: {url}")
+            return None
         except WebDriverException as e:
-            self.logger.error(f"Error de WebDriver obteniendo HTML de {url}: {e}")
+            self.logger.error(f"WebDriverException while fetching {url}: {e}")
+            # Consider re-initializing driver or quitting if it's a persistent issue
+            # self.quit_webdriver() # or self.driver = None
+            return None
         except Exception as e:
-            self.logger.error(f"Error inesperado obteniendo HTML con Selenium de {url}: {e}")
-        return None
+            self.logger.error(f"Unexpected error fetching with Selenium {url}: {e}")
+            return None
 
-    def _get_html_with_requests(self, url):
+    def _build_search_url(self, keyword, page_number):
         """
-        Obtiene el contenido HTML de una URL usando Requests (si Selenium no es necesario).
-        """
-        self.logger.info(f"Obteniendo HTML con Requests desde: {url}")
-        headers = {
-            'User-Agent': self.user_agent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.9,es;q=0.8,en;q=0.7',
-        }
-        try:
-            response = requests.get(url, headers=headers, timeout=self.config.get('requests_timeout', 30))
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding if response.apparent_encoding else 'utf-8'
-            html_content = response.text
-            self.logger.info(f"HTML obtenido con Requests desde {url} (longitud: {len(html_content)})")
-            return html_content
-        except requests.exceptions.HTTPError as e:
-            self.logger.error(f"Error HTTP {e.response.status_code} obteniendo {url} con Requests: {e.response.text[:200]}...")
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error de Requests obteniendo HTML de {url}: {e}")
-        return None
-    
-    def _fetch_page_html(self, url):
-        """Decide si usar Selenium o Requests para obtener el HTML."""
-        if self.use_selenium:
-            return self._get_html_with_selenium(url)
-        else:
-            return self._get_html_with_requests(url)
-
-    def _build_search_url(self, keyword, page_number=1):
-        """
-        Construye la URL de búsqueda para una palabra clave y número de página dados.
-        El portal de Embrapa parece usar `https://www.embrapa.br/busca-de-publicacoes?termo=<keyword>&pagina=<num>`
-        pero esto podría variar o necesitar ajustes.
+        Builds the search URL for a given keyword and page number.
+        Example for Embrapa main site (hypothetical, based on common patterns):
+        https://www.embrapa.br/busca-de-publicacoes?p_p_id=resultadoBuscaPortlet_WAR_buscaportlet&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view&p_p_col_id=column-1&p_p_col_count=1&_resultadoBuscaPortlet_WAR_buscaportlet_q=milho&_resultadoBuscaPortlet_WAR_buscaportlet_delta=10&_resultadoBuscaPortlet_WAR_buscaportlet_cur=1
+        Here, 'q' is the keyword, 'cur' is the page number (1-indexed), 'delta' is results per page.
         """
         if not self.base_search_url:
-            self.logger.error("URL base de búsqueda no configurada ('search_config.base_url').")
+            self.logger.error("Base search URL is not configured. Cannot build search URL.")
             return None
-        
-        # Codificar la palabra clave para la URL
-        encoded_keyword = quote_plus(keyword)
-        
-        params = {self.query_param: encoded_keyword}
-        
-        # El manejo de la paginación varía mucho:
-        # 1. Parámetro de página (ej. page=2)
-        # 2. Parámetro de offset/start (ej. start=20 si results_per_page=20)
-        # 3. Parte de la URL path (ej. /search/keyword/page/2)
-        # Asumimos un parámetro de página por defecto.
-        if page_number > 1:
-            # El portal de Embrapa parece usar 'pagina' y es 0-indexed o 1-indexed.
-            # Si 'pagina' es el parámetro y es 1-indexed:
-            # params[self.page_param] = page_number
-            # Si es 0-indexed, sería page_number - 1.
-            # La URL de ejemplo de Embrapa usa `pagina=2` para la segunda página, así que parece 1-indexed.
-            params[self.page_param] = page_number
-        
-        # Construir la URL con los parámetros
-        # No usamos urlencode directamente en base_search_url si ya tiene un ' ? '
-        if '?' in self.base_search_url:
-            url_parts = list(urlparse(self.base_search_url))
-            query = parse_qs(url_parts[4])
-            query.update(params)
-            url_parts[4] = urlencode(query, doseq=True)
-            search_url = urlunparse(url_parts)
-        else:
-            search_url = f"{self.base_search_url}?{urlencode(params)}"
-            
-        self.logger.debug(f"URL de búsqueda construida: {search_url}")
-        return search_url
 
-    def _parse_search_results(self, html_content, search_url_base_for_relative_links):
+        # This is a simplified example. Real Embrapa URL might be more complex.
+        # The actual params (q, page, etc.) come from self.search_query_param, self.pagination_param
+        params = {
+            self.search_query_param: keyword,
+            # self.search_config.get('results_per_page_param', 'delta'): self.search_results_per_page, # If site uses this
+            self.pagination_param: page_number
+        }
+        # Add any fixed parameters from config
+        fixed_params = self.search_config.get('fixed_params', {})
+        params.update(fixed_params)
+
+        # The base_search_url might already contain some query parameters.
+        # A robust way is to parse the base_url, add/update params, then reconstruct.
+        # For simplicity here, we assume base_search_url is the part before '?' or has a trailing '&' if params exist.
+        if '?' in self.base_search_url:
+            separator = '&'
+        else:
+            separator = '?'
+        
+        # Properly encode parameters
+        query_string = urlencode(params)
+        full_url = f"{self.base_search_url.rstrip('&')}{separator}{query_string}"
+        self.logger.debug(f"Built search URL: {full_url}")
+        return full_url
+
+    def _parse_search_results(self, html_content, search_url):
         """
-        Parsea el contenido HTML de una página de resultados de búsqueda.
+        Parses the HTML of a search results page to extract item details.
 
         Args:
-            html_content (str): Contenido HTML de la página.
-            search_url_base_for_relative_links (str): URL base para resolver enlaces relativos.
+            html_content (str): The HTML content of the search results page.
+            search_url (str): The URL of the search page (for resolving relative links).
 
         Returns:
-            tuple: (list_of_items, next_page_url)
-                   list_of_items: lista de diccionarios, cada uno con 'title' y 'item_page_url'.
-                   next_page_url: URL de la siguiente página de resultados, o None.
+            tuple: (list_of_items, has_next_page)
+                     list_of_items is a list of dicts, each with 'title' and 'item_page_url'.
+                     has_next_page is a boolean.
         """
         if not html_content:
-            return [], None
+            self.logger.warning("HTML content is empty for parsing search results.")
+            return [], False
+        
+        if not self.item_container_xpath or not self.title_xpath or not self.link_to_item_page_xpath:
+            self.logger.error("Cannot parse search results: critical selectors are missing.")
+            return [], False
         
         try:
-            doc = html.fromstring(html_content)
+            tree = html.fromstring(html_content)
         except Exception as e:
-            self.logger.error(f"Error parseando HTML de resultados de búsqueda: {e}")
-            return [], None
+            self.logger.error(f"Failed to parse HTML for search results from {search_url}: {e}")
+            return [], False
 
-        found_items = []
-        item_container_xpath = self.selectors_dict.get('item_container')
-        item_link_xpath = self.selectors_dict.get('item_link')
-        item_title_xpath = self.selectors_dict.get('item_title') # Opcional, para logueo
+        extracted_items = []
+        item_elements = tree.xpath(self.item_container_xpath)
+        self.logger.info(f"Found {len(item_elements)} potential item containers on {search_url} using xpath: {self.item_container_xpath}")
 
-        if not item_container_xpath or not item_link_xpath:
-            self.logger.error("Selectores críticos para resultados de búsqueda no configurados: 'item_container' o 'item_link'. Verifica 'web_search_results' en selectors.yaml")
-            return [], None
+        if not item_elements and html_content: # If no items, log a snippet for debugging selectors
+            snippet = html_content[:1000].replace('\n',' ')
+            self.logger.warning(f"No item containers found. HTML snippet from {search_url}: {snippet}...")
 
-        self.logger.debug(f"Usando selector de contenedor: {item_container_xpath}")
-        for container in doc.xpath(item_container_xpath):
+        for element in item_elements:
+            title = ""
+            item_page_url = ""
             try:
-                link_elements = container.xpath(item_link_xpath)
-                if link_elements:
-                    relative_item_url = str(link_elements[0]).strip()
-                    item_page_url = urljoin(search_url_base_for_relative_links, relative_item_url)
-                    
-                    title = "N/A"
-                    if item_title_xpath:
-                        title_elements = container.xpath(item_title_xpath)
-                        if title_elements:
-                            title = str(title_elements[0]).strip()
-                    
-                    found_items.append({'title': title, 'item_page_url': item_page_url})
-                    self.logger.debug(f"Ítem encontrado: '{title[:50]}...' en {item_page_url}")
+                title_elements = element.xpath(self.title_xpath)
+                if title_elements:
+                    # Handle cases where title might be split across multiple text nodes or within sub-tags
+                    title = " ".join([t.strip() for t in title_elements if isinstance(t, str) or hasattr(t, 'text_content')]).strip()
+                    if not title and hasattr(title_elements[0], 'text_content'): # Fallback for complex elements
+                         title = title_elements[0].text_content().strip()
                 else:
-                    self.logger.warning(f"Contenedor de ítem encontrado pero sin enlace usando selector: {item_link_xpath}")
-            except Exception as e:
-                self.logger.error(f"Error extrayendo datos de un ítem individual en resultados de búsqueda: {e}")
-        
-        self.logger.info(f"Se encontraron {len(found_items)} ítems en esta página de resultados.")
+                    self.logger.warning(f"Title not found for an item on {search_url} using xpath: {self.title_xpath} relative to container.")
 
-        # Encontrar enlace a la siguiente página
-        next_page_url = None
-        next_page_selector = self.selectors_dict.get('next_page_link')
-        if next_page_selector:
-            next_page_elements = doc.xpath(next_page_selector)
-            if next_page_elements:
-                relative_next_url = str(next_page_elements[0]).strip()
-                next_page_url = urljoin(search_url_base_for_relative_links, relative_next_url)
-                self.logger.info(f"Enlace a la siguiente página de resultados encontrado: {next_page_url}")
-            else:
-                self.logger.info("No se encontró enlace a la siguiente página de resultados usando el selector.")
-        else:
-            self.logger.info("No hay selector configurado para 'next_page_link'. Asumiendo que no hay más páginas o se maneja diferente.")
+                link_elements = element.xpath(self.link_to_item_page_xpath)
+                if link_elements:
+                    # link_elements could be a string (from @href) or an element
+                    raw_link = link_elements[0] if isinstance(link_elements[0], str) else link_elements[0].get('href')
+                    if raw_link:
+                        item_page_url = urljoin(search_url, raw_link.strip()) # Ensure absolute URL
+                else:
+                    self.logger.warning(f"Item page link not found for an item on {search_url} using xpath: {self.link_to_item_page_xpath} relative to container.")
+
+                if title and item_page_url:
+                    # Basic validation of URL (optional)
+                    if not (item_page_url.startswith('http://') or item_page_url.startswith('https://')):
+                        self.logger.warning(f"Extracted item page URL seems invalid: {item_page_url}. Skipping.")
+                        continue
+                    
+                    extracted_items.append({
+                        'title': title,
+                        'item_page_url': item_page_url
+                    })
+                    self.logger.debug(f"Extracted item: Title='{title}', URL='{item_page_url}'")
+                else:
+                    self.logger.debug(f"Skipping item due to missing title or URL. Title found: '{bool(title)}', URL found: '{bool(item_page_url)}'")
             
-        return found_items, next_page_url
+            except Exception as e:
+                self.logger.error(f"Error parsing a specific item element on {search_url}: {e}", exc_info=False)
+                # Log the problematic element's HTML for debugging
+                try:
+                    problematic_html = html.tostring(element, pretty_print=True).decode('utf-8')[:500]
+                    self.logger.debug(f"Problematic item HTML snippet: {problematic_html}...")
+                except Exception as e_log:
+                    self.logger.error(f"Could not serialize problematic element: {e_log}")
+                continue
+        
+        has_next_page = False
+        if self.next_page_link_xpath:
+            next_page_elements = tree.xpath(self.next_page_link_xpath)
+            if next_page_elements:
+                # Check if the element is not disabled or marked as current page link in some way
+                # This logic might need to be very site-specific.
+                # For now, just presence implies next page.
+                has_next_page = True
+                self.logger.info(f"'Next page' link found on {search_url}.")
+            else:
+                self.logger.info(f"No 'Next page' link found on {search_url} (or XPath {self.next_page_link_xpath} failed).")
+        else:
+            self.logger.debug("'next_page_link_xpath' not configured, assuming no pagination check needed from parser.")
+
+        return extracted_items, has_next_page
 
     def search_by_keyword(self, keyword):
         """
-        Realiza una búsqueda por palabra clave y procesa los resultados.
+        Performs a search for a given keyword and processes the results.
 
         Args:
-            keyword (str): La palabra clave a buscar.
+            keyword (str): The keyword to search for.
 
         Returns:
-            int: Número de ítems procesados y guardados/actualizados en la BD.
+            int: Count of new items found and added/updated in the DB.
         """
-        if not self.base_search_url:
-            self.logger.error("Búsqueda por palabra clave no configurada (falta 'base_search_url').")
+        if not self.base_search_url or not self.item_container_xpath:
+            self.logger.error(f"Keyword search cannot proceed: base_search_url or item_container_xpath not configured for keyword: '{keyword}'")
             return 0
         
-        if self.use_selenium and not self.driver:
-            if not self._init_webdriver(): # Asegurar que el driver esté listo
-                self.logger.error("No se pudo inicializar Selenium. Abortando búsqueda por palabra clave.")
-                return 0
-        
-        self.logger.info(f"--- Iniciando búsqueda por palabra clave: '{keyword}' ---")
-        
-        current_page_number = 1
-        processed_item_count = 0
-        consecutive_empty_pages = 0
-        max_consecutive_empty_before_stop = 2 # Detener si N páginas seguidas no devuelven ítems
+        if not self.db_manager:
+            self.logger.error("Database manager not available. Keyword search results cannot be saved.")
+            return 0
 
-        while current_page_number <= self.max_pages_to_search:
-            if processed_item_count >= self.max_items_to_process:
-                self.logger.info(f"Se alcanzó el límite de {self.max_items_to_process} ítems a procesar para la palabra clave '{keyword}'.")
-                break
+        if not self._init_webdriver(): # Ensure WebDriver is ready
+            self.logger.error("WebDriver could not be initialized. Aborting keyword search.")
+            return 0
 
-            search_url = self._build_search_url(keyword, current_page_number)
+        self.logger.info(f"Starting keyword search for: '{keyword}'")
+        total_new_items_found_for_keyword = 0
+        processed_urls_this_session = set() # Avoid processing same URL multiple times if it appears on different pages
+
+        for page_num in range(self.start_page_number, self.start_page_number + self.max_search_pages):
+            self.logger.info(f"Searching for '{keyword}', page: {page_num}") 
+            search_url = self._build_search_url(keyword, page_num)
             if not search_url:
-                self.logger.error("No se pudo construir la URL de búsqueda. Abortando.")
-                break
-            
-            self.logger.info(f"Buscando en: {search_url} (Página {current_page_number}/{self.max_pages_to_search})")
-            html_content = self._fetch_page_html(search_url)
-            
+                self.logger.error("Failed to build search URL. Skipping page.")
+                continue
+
+            html_content = self._get_html_with_selenium(search_url)
             if not html_content:
-                self.logger.warning(f"No se pudo obtener HTML para {search_url}. Intentando siguiente página si aplica.")
-                # Podríamos considerar esto como una página vacía o un error más serio.
-                # Por ahora, si falla la obtención, podría ser el fin o un problema temporal.
-                consecutive_empty_pages += 1 
-                if consecutive_empty_pages >= max_consecutive_empty_before_stop:
-                    self.logger.warning(f"{max_consecutive_empty_before_stop} páginas consecutivas sin resultados/HTML. Deteniendo búsqueda para '{keyword}'.")
-                    break
-                current_page_number += 1
-                if current_page_number <= self.max_pages_to_search and self.search_delay_between_pages > 0:
-                    self.logger.info(f"Esperando {self.search_delay_between_pages}s antes de la siguiente página de búsqueda...")
-                    time.sleep(self.search_delay_between_pages)
-                continue # Saltar al siguiente ciclo del while para la próxima página
+                self.logger.warning(f"No HTML content received for {search_url}. Skipping page.")
+                # Potentially a sign of being blocked or end of results if it keeps happening
+                # Could implement a counter for consecutive empty pages to break early
+                continue
 
-            # Usar la URL base del portal para resolver enlaces relativos de los items
-            # Si base_search_url es algo como https://example.com/search, la base es https://example.com
-            parsed_search_url = urlparse(self.base_search_url)
-            base_url_for_relative_links = f"{parsed_search_url.scheme}://{parsed_search_url.netloc}"
-
-            items_on_page, next_page_link_from_parser = self._parse_search_results(html_content, base_url_for_relative_links)
+            items_on_page, has_next = self._parse_search_results(html_content, search_url)
 
             if not items_on_page:
-                self.logger.info(f"No se encontraron ítems en la página {current_page_number} para '{keyword}'.")
-                consecutive_empty_pages += 1
-                if consecutive_empty_pages >= max_consecutive_empty_before_stop:
-                    self.logger.warning(f"{max_consecutive_empty_before_stop} páginas consecutivas sin ítems. Deteniendo búsqueda para '{keyword}'.")
+                self.logger.info(f"No items found on page {page_num} for keyword '{keyword}'. URL: {search_url}")
+                # If this is the first page (page_num == self.start_page_number) and no items, maybe no results at all.
+                if page_num == self.start_page_number:
+                    self.logger.info(f"No items found on the first results page for '{keyword}'. Assuming no results or selector issue.")
+                    break # No point in continuing for this keyword if first page is empty
+                # If not first page, and no items, could be end of results or parsing issue.
+                # If has_next is also false, then it is likely end of results.
+                if not has_next:
+                    self.logger.info(f"No items and no 'next page' link found on page {page_num} for '{keyword}'. Ending search for this keyword.")
                     break
-            else:
-                consecutive_empty_pages = 0 # Resetear contador si se encontraron ítems
-
+                # If no items but has_next is true, it might be an intermittent issue or selector problem on this specific page.
+                # We continue to the next page based on has_next, but log it.
+                self.logger.warning(f"No items found on page {page_num} for '{keyword}', but a 'next page' link was detected. Proceeding to next page.")
+            
+            page_items_processed = 0
             for item_data in items_on_page:
-                if processed_item_count >= self.max_items_to_process:
-                    self.logger.info(f"Límite de {self.max_items_to_process} ítems alcanzado a mitad de página.")
-                    break # Salir del bucle for de items
-                try:
-                    self.logger.debug(f"Procesando ítem de búsqueda: Título='{item_data['title'][:50]}...', URL='{item_data['item_page_url']}'")
-                    item_id, created = self.db_manager.get_or_create_item(
-                        item_page_url=item_data['item_page_url'],
-                        repository_source=f"keyword_search_{urlparse(self.base_search_url).netloc}", # Fuente: ej. keyword_search_www.embrapa.br
-                        # oai_identifier será None para items de búsqueda por palabra clave inicialmente
-                    )
-                    if created:
-                        self.logger.info(f"Nuevo ítem (de búsqueda) creado en BD con ID {item_id} para URL: {item_data['item_page_url']}")
-                        # Guardar metadatos básicos si los tenemos (título)
-                        self.db_manager.log_item_metadata(item_id, {'title': item_data['title'], 'item_page_url': item_data['item_page_url']}, source_type='keyword_search_result')
-                        self.db_manager.update_item_status(item_id, 'pending_html_processing') # Necesita que se procese su HTML para metadatos y PDF
+                item_page_url = item_data.get('item_page_url')
+                item_title = item_data.get('title', '[No Title Found]')
+                
+                if not item_page_url:
+                    self.logger.warning(f"Skipping item with no page URL. Title: {item_title}")
+                    continue
+                
+                if item_page_url in processed_urls_this_session:
+                    self.logger.debug(f"Skipping already processed URL in this session: {item_page_url}")
+                    continue
+                processed_urls_this_session.add(item_page_url)
+
+                # Use a generic repository_source for items found via web search
+                repo_source = self.search_config.get('repository_source_keyword_search', 'embrapa_keyword_search')
+                item_id, is_new = self.db_manager.get_or_create_item(
+                    repository_source=repo_source,
+                    item_page_url=item_page_url,
+                    initial_status='pending_html_processing' # Items from keyword search need HTML processing for PDF link
+                )
+
+                if item_id:
+                    page_items_processed += 1
+                    if is_new:
+                        total_new_items_found_for_keyword += 1
+                        self.logger.info(f"New item from keyword search '{keyword}': ID {item_id}, URL: {item_page_url}")
+                        # Log basic metadata found on search page (title)
+                        self.db_manager.log_item_metadata(item_id, title=item_title)
                     else:
-                        self.logger.info(f"Ítem existente (de búsqueda o OAI previo) encontrado en BD con ID {item_id} para URL: {item_data['item_page_url']}")
-                        # Si ya existe, no actualizamos estado a menos que queramos forzar reprocesamiento
-                    
-                    processed_item_count += 1
-                except Exception as e:
-                    self.logger.error(f"Error procesando/guardando en BD el ítem de búsqueda {item_data.get('item_page_url', 'URL_DESCONOCIDA')}: {e}")
+                        self.logger.info(f"Existing item found from keyword search '{keyword}': ID {item_id}, URL: {item_page_url}. Will check/update status.")
+                        # Optionally, update title if it changed or wasn't logged before
+                        # self.db_manager.log_item_metadata(item_id, title=item_title) 
+                else:
+                    self.logger.error(f"Failed to get/create DB entry for item URL: {item_page_url}")
             
-            if processed_item_count >= self.max_items_to_process:
-                break # Salir del bucle while si se alcanzó el límite después de procesar la página
+            self.logger.info(f"Processed {page_items_processed} items from page {page_num} for keyword '{keyword}'.")
 
-            if next_page_link_from_parser: # Si el parser encontró un enlace a la siguiente página
-                # No necesitamos construir la URL, ya la tenemos. Simplemente avanzamos.
-                # Podríamos querer validar si esta URL es la misma que construiríamos nosotros, pero por ahora confiamos en el parser.
-                self.logger.info(f"Avanzando a la siguiente página de resultados: {next_page_link_from_parser}")
-                # En este caso, no usamos current_page_number para construir la URL, pero sí para el log y el límite de max_pages
-                current_page_number += 1
-            elif self.page_param: # Si no hay enlace explícito pero sí un parámetro de página, intentamos la siguiente
-                current_page_number += 1
-            else: # No hay cómo saber la siguiente página
-                self.logger.info(f"No hay enlace a la siguiente página ni parámetro de página configurado. Fin de la búsqueda para '{keyword}'.")
-                break
+            if not has_next:
+                self.logger.info(f"No 'next page' link detected on page {page_num} for '{keyword}'. Ending search for this keyword.")
+                break # End of results for this keyword
             
-            if current_page_number <= self.max_pages_to_search and self.search_delay_between_pages > 0:
-                self.logger.info(f"Esperando {self.search_delay_between_pages}s antes de la siguiente página de búsqueda...")
-                time.sleep(self.search_delay_between_pages)
-        
-        self.logger.info(f"--- Búsqueda por palabra clave '{keyword}' finalizada. Total ítems procesados/registrados: {processed_item_count} ---")
-        return processed_item_count
+            if page_num < self.start_page_number + self.max_search_pages - 1: # if not the last configured page to check
+                self.logger.info(f"Pausing for {self.search_delay_seconds} seconds before next search page...")
+                time.sleep(self.search_delay_seconds)
+            else:
+                self.logger.info(f"Reached max_search_pages ({self.max_search_pages}) for keyword '{keyword}'.")
 
-    def close(self):
-        """Cierra el WebDriver de Selenium si está abierto."""
+        self.logger.info(f"Keyword search for '{keyword}' completed. Found and registered {total_new_items_found_for_keyword} new items.")
+        return total_new_items_found_for_keyword
+
+    def quit_webdriver(self):
+        """Closes the WebDriver session if it's active."""
         if self.driver:
             try:
-                self.logger.info("Cerrando WebDriver de Selenium...")
+                self.logger.info("Quitting Selenium WebDriver.")
                 self.driver.quit()
-                self.driver = None
-                self.logger.info("WebDriver de Selenium cerrado.")
             except Exception as e:
-                self.logger.error(f"Error cerrando WebDriver de Selenium: {e}")
+                self.logger.error(f"Error quitting WebDriver: {e}")
+            finally:
+                self.driver = None
 
-# Ejemplo de uso (requiere mocks o una BD, config, etc. reales)
+# Example Usage (Illustrative)
 if __name__ == '__main__':
-    # --- Mockups para prueba --- 
-    class MockLogger:
-        def info(self, msg): print(f"INFO: {msg}")
-        def error(self, msg): print(f"ERROR: {msg}")
-        def warning(self, msg): print(f"WARNING: {msg}")
-        def debug(self, msg): print(f"DEBUG: {msg}")
+    # Setup basic logging for the example
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    main_logger = logging.getLogger("KeywordSearcherBRExample")
 
-    class MockDBManager:
-        def get_or_create_item(self, item_page_url, repository_source, oai_identifier=None):
-            print(f"DB: Get/Create item URL {item_page_url} from {repository_source}")
-            return f"fake_item_id_for_{item_page_url.split('/')[-1]}", True # Simula creación
-        def log_item_metadata(self, item_id, metadata_dict, source_type):
-            print(f"DB: Logged metadata for item {item_id} (source: {source_type}), Title: {metadata_dict.get('title', 'N/A')[:30]}")
-        def update_item_status(self, item_id, status):
-            print(f"DB: Updated status for item {item_id} to {status}")
-
-    mock_logger = MockLogger()
-    mock_db_manager = MockDBManager()
-    # Configuración de ejemplo para el portal de Embrapa
-    mock_config = {
+    # Mock configuration (replace with actual loading from a config file or dict)
+    # IMPORTANT: The selectors here are CRITICAL and ENTIRELY HYPOTHETICAL.
+    # They MUST be derived from actual analysis of Embrapa's search results page.
+    mock_config_dict = {
         'search_config': {
-            'base_url': 'https://www.embrapa.br/busca-de-publicacoes',
-            'query_param': 'termo',
-            'page_param': 'pagina',
-            'use_selenium': True, # Cambiar a False para probar con Requests si el sitio lo permite
-            'max_pages_per_keyword': 2, # Limitar para prueba
+            'base_url': 'https://www.embrapa.br/busca-de-publicacoes', # Example, needs verification
+            'query_param': '_resultadoBuscaPortlet_WAR_buscaportlet_q', # From observed URL
+            'pagination_param': '_resultadoBuscaPortlet_WAR_buscaportlet_cur', # From observed URL
+            'start_page_number': 1, # Embrapa seems 1-indexed for 'cur'
+            'max_search_pages_per_keyword': 2, # Limit for example
+            'search_delay_seconds': 2,
+            'selenium_timeout': 20,
+            'repository_source_keyword_search': 'embrapa_portal_search',
+            'fixed_params': { # Parameters that seem fixed in Embrapa's search URL structure
+                'p_p_id': 'resultadoBuscaPortlet_WAR_buscaportlet',
+                'p_p_lifecycle': '0',
+                'p_p_state': 'normal',
+                'p_p_mode': 'view',
+                'p_p_col_id': 'column-1',
+                'p_p_col_count': '1',
+                '_resultadoBuscaPortlet_WAR_buscaportlet_delta': '10' # Results per page
+            }
         },
-        'max_items_keyword_search': 5, # Limitar para prueba
-        'user_agent': 'TestKeywordSearcher/1.0',
-        # 'selenium_chrome_driver_path': '/ruta/a/tu/chromedriver' # Descomentar y poner ruta real si es necesario
-        'selectors_file_br': 'selectors.yaml' # Nombre del archivo, no el dict aquí
+        'webdriver_path': 'chromedriver',  # Or specify full path if not in PATH
+        'user_agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' # Example User Agent
     }
-    # Para la prueba, necesitaríamos cargar los selectores de un archivo o mockearlos
-    mock_selectors_dict_for_searcher = {
-        'web_search_results': {
-            'item_container': "//div[contains(@class, 'conteudoListaResultado')]//li[contains(@class, ' ResultadoBuscaPublicacao')]",
-            'item_link': ".//h3[contains(@class, 'titulo')]/a/@href",
-            'item_title': ".//h3[contains(@class, 'titulo')]/a/text()",
-            'next_page_link': "//a[@class='proximo' and contains(text(), 'Próxima')]/@href"
+
+    # HYPOTHETICAL SELECTORS - THESE WILL NOT WORK WITHOUT REAL ANALYSIS
+    mock_selectors = {
+        'web_search_results_selectors': {
+            'item_container': "//div[contains(@class, 'resultado_busca_item') or contains(@class, 'search-result-item')]", # Placeholder
+            'title': ".//h3/a/text() | .//div[contains(@class, 'title')]/a/text()", # Placeholder
+            'link_to_item_page': ".//h3/a/@href | .//div[contains(@class, 'title')]/a/@href", # Placeholder
+            'next_page_link': "//a[contains(text(), 'Próxima') or contains(@class, 'next') or contains(text(), '>') and not(contains(@class, 'disabled'))]/@href" # Placeholder
         }
     }
-    # --- Fin Mockups ---
 
-    searcher = KeywordSearcherBR(mock_config, mock_logger, mock_db_manager, None, mock_selectors_dict_for_searcher)
+    main_logger.info("Initializing KeywordSearcherBR for example...")
+    # Using mock DB and logger for this standalone example
+    searcher = KeywordSearcherBR(
+        config=mock_config_dict, 
+        logger=main_logger, # Using main_logger here
+        db_manager=MockDBManager(), 
+        selectors_dict=mock_selectors
+    )
 
-    mock_logger.info("--- Iniciando prueba del KeywordSearcherBR ---")
-    keyword_to_test = "maiz" # "soja", "trigo", "algodon"
-    
-    if not searcher.use_selenium or searcher._init_webdriver(): # Solo buscar si selenium se inicializa bien (o no se usa)
-        items_found = searcher.search_by_keyword(keyword_to_test)
-        mock_logger.info(f"Búsqueda por '{keyword_to_test}' completada. Ítems procesados/registrados: {items_found}")
-    else:
-        mock_logger.error("No se pudo inicializar Selenium, la prueba de búsqueda no se ejecutará.")
+    test_keyword = "milho" # Corn in Portuguese
+    main_logger.info(f"Starting example search for keyword: '{test_keyword}'")
 
-    searcher.close() # Importante para cerrar el navegador Selenium
-    mock_logger.info("--- Prueba del KeywordSearcherBR finalizada ---")
+    # Ensure webdriver_path in mock_config_dict points to your actual chromedriver or is in PATH
+    # This example will attempt to run Selenium.
+    # If selectors are not correct for Embrapa, it will likely find 0 items or fail parsing.
+    try:
+        # items_found = searcher.search_by_keyword(test_keyword)
+        # main_logger.info(f"Example search for '{test_keyword}' found {items_found} new items.")
+        main_logger.info("Example search call is commented out to prevent actual web requests during non-interactive tests.")
+        main_logger.info("To run a real test, uncomment the search_by_keyword call and ensure correct selectors and WebDriver setup.")
+        
+        # Example of how to build a URL (for testing the builder)
+        # url_test = searcher._build_search_url("soja", 2)
+        # main_logger.info(f"Test URL build: {url_test}")
+
+    except Exception as e:
+        main_logger.error(f"An error occurred during the example: {e}", exc_info=True)
+    finally:
+        searcher.quit_webdriver() # Important to clean up WebDriver session
+        main_logger.info("KeywordSearcherBR example finished.")
+
+    pass
