@@ -81,7 +81,7 @@ class ScraperBR:
         self.selectors = self._load_selectors()
 
         self.db_manager = DatabaseManagerBR(self.config['db_file'], self.logger)
-        # self.db_manager.initialize_db() # Esta línea es redundante y causaba error. _initialize_db() se llama en el constructor de DatabaseManagerBR.
+        self.db_manager.initialize_db()
 
         # Pasar self.db_manager a ResourceDownloaderBR
         self.downloader = ResourceDownloaderBR(self.config, self.logger, self.db_manager)
