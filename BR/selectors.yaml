@@ -1,53 +1,79 @@
-# Selectores XPath para extraer metadatos y enlaces PDF de las páginas HTML de repositorios DSpace (y otros)
-# Adaptado para el scraper de Brasil (BR)
+# Selectors for DSpace repositories (like Alice and Infoteca-e from Embrapa)
+# These are general placeholders and might need specific adjustments per repository instance.
 
+# Selectors for extracting PDF links from an item's page
 pdf_link_selectors:
-  # Selector general para enlaces PDF en páginas de ítems (DSpace)
-  - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Fichero') or contains(text(),'File')]]//div[@class='page-link-wrapper']/a/@href"
-  - "//a[contains(@href, '.pdf') and (contains(lower-case(text()), 'pdf') or contains(lower-case(text()), 'texto completo') or contains(lower-case(text()), 'full text'))]/@href"
-  - "//a[.//img[contains(@alt, 'pdf') or contains(@src, 'pdf_icon')]]/@href" # Enlace PDF que contiene una imagen de icono PDF
-  - "//div[@class='file-link']/a[contains(@href, '.pdf')]/@href"
+  # Tries to find a direct link to a PDF within standard DSpace metadata fields or common link texts
+  - path: "//a[contains(@href, '.pdf') and (contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'pdf') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'texto completo') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'full text'))]/@href"
+  - path: "//meta[@name='citation_pdf_url']/@content" # Standard highwire press tag for PDF URL
+  - path: "//meta[@name='DC.Identifier' and contains(@content, '.pdf')]/@content" # Dublin Core identifier if it's a PDF link
+  - path: "//div[contains(@class, 'file-link')]/a[contains(@href, '.pdf')]/@href" # Common class for file links
 
+# Selectors for extracting individual metadata fields from an item's page
+# These primarily target Dublin Core metadata tags, common in DSpace.
 metadata_selectors:
-  # Selectores para metadatos individuales. Estos son ejemplos y pueden necesitar ajustes.
-  # La fuente primaria de metadatos debería ser OAI si está disponible.
   title:
-    - "//meta[@name='DC.title']/@content"
-    - "//meta[@name='citation_title']/@content"
-    - "//h1[contains(@class, 'page-header')]/text()"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Título') or contains(text(),'Title')]]//div[2]//text()"
+    - path: "//meta[@name='DC.title']/@content"
+    - path: "//meta[@name='citation_title']/@content"
+    - path: "//h1[contains(@class, 'page-header') or contains(@class, 'ds-artifact-title')]/text()"
   author:
-    - "//meta[@name='DC.creator']/@content"
-    - "//meta[@name='citation_author']/@content"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Autor') or contains(text(),'Author')]]//div[2]//a/text()"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Autor') or contains(text(),'Author')]]//div[2]//text()"
-  publication_date:
-    - "//meta[@name='DCTERMS.issued']/@content"
-    - "//meta[@name='citation_publication_date']/@content"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Fecha de publicación') or contains(text(),'Publication date')]]//div[2]//text()"
+    # Extracts multiple authors if present
+    - path: "//meta[@name='DC.creator']/@content"
+    - path: "//meta[@name='citation_author']/@content"
+    - path: "//div[contains(@class, 'ds-dc_contributor_author-value') or contains(@class, 'author-value')]/a/text()"
+  publication_date: # Tries to get the issue date
+    - path: "//meta[@name='DCTERMS.issued']/@content"
+    - path: "//meta[@name='DC.date.issued']/@content"
+    - path: "//meta[@name='citation_date']/@content"
+    - path: "//div[contains(@class, 'ds-dc_date_issued-value') or contains(@class, 'date-value')]/text()"
   abstract:
-    - "//meta[@name='DCTERMS.abstract']/@content"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Resumen') or contains(text(),'Abstract')]]//div[2]//text()"
+    - path: "//meta[@name='DCTERMS.abstract']/@content"
+    - path: "//meta[@name='DC.description.abstract']/@content"
+    - path: "//div[contains(@class, 'ds-dc_description_abstract-value') or contains(@class, 'abstract-value')]/p/text()"
   keywords:
-    - "//meta[@name='DC.subject']/@content"
-    - "//meta[@name='citation_keywords']/@content"
-    - "//div[contains(@class, 'item-page-field-wrapper') and descendant::span[contains(text(),'Palabras clave') or contains(text(),'Keywords')]]//div[2]//text()"
+    # Extracts multiple keywords if present
+    - path: "//meta[@name='DC.subject']/@content"
+    - path: "//meta[@name='citation_keywords']/@content"
+    - path: "//div[contains(@class, 'ds-dc_subject-value') or contains(@class, 'keywords-value')]/a/text()"
   doi:
-    - "//meta[@name='citation_doi']/@content"
-    - "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/text()"
-    - "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/@href"
-  # ... otros metadatos que se puedan necesitar
+    - path: "//meta[@name='DC.identifier.doi']/@content"
+    - path: "//meta[@name='citation_doi']/@content"
+    - path: "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/text()"
+    - path: "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/@href" # Fallback to href if text is not DOI
+  item_page_url: # Canonical URL of the item page itself
+    - path: "//link[@rel='canonical']/@href"
+    - path: "//meta[@name='DC.identifier.uri']/@content"
+    - path: "//meta[@name='citation_abstract_html_url']/@content"
 
-# Selectores para resultados de búsqueda web (si se implementa)
-web_search_results:
-  item_container: "//div[contains(@class, 'search-result-item')]" # Contenedor de cada resultado
-  item_link: ".//h3/a/@href"  # Enlace a la página del ítem, relativo al contenedor
-  item_title: ".//h3/a/text()" # Título del ítem
-  next_page_link: "//a[contains(text(), 'Próxima') or contains(text(), 'Next')]/@href" # Enlace a la siguiente página de resultados
 
-# Selectores para OAI Harvester (Placeholder - OAI no usa selectores HTML de esta manera)
+# Selectors for web search results (Embrapa main site search)
+# These are highly dependent on the specific structure of Embrapa's search results page.
+# Placeholder - to be filled after analyzing Embrapa's search results page structure.
+web_search_results_selectors:
+  item_container: "" # XPath to the repeating element that contains each search result item
+  title: ""          # XPath relative to item_container for the title
+  link_to_item_page: "" # XPath relative to item_container for the link to the item's detail page
+  next_page_link: ""    # XPath for the "next page" link in pagination
+
+# Selectors for OAI harvesting (these are not XPaths for HTML, but keys for parsing OAI XML)
+# This section is more of a conceptual guide as OAI parsing is usually done with XML libraries directly.
 oai_selectors:
-  # Los datos OAI se parsean de XML, no con selectores CSS/XPath de la misma forma que el HTML.
-  # Esta sección es un placeholder o para referencia si alguna vez se necesitara
-  # parsear información HTML relacionada con el flujo OAI.
-  placeholder: "No aplica directamente para OAI-PMH XML parsing"
+  record_identifier: "{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}identifier"
+  datestamp: "{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}datestamp"
+  # Dublin Core metadata elements (prefix 'oai_dc:dc' for OAI-PMH with Dublin Core)
+  dc_title: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}title"
+  dc_creator: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}creator"
+  dc_subject: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}subject"
+  dc_description: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}description"
+  dc_publisher: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}publisher"
+  dc_contributor: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}contributor"
+  dc_date: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}date" # Often the publication date
+  dc_type: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}type"
+  dc_format: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}format" # Can indicate 'application/pdf'
+  dc_identifier: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}identifier" # Can be URL, DOI, etc.
+  dc_source: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}source"
+  dc_language: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}language"
+  dc_relation: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}relation"
+  dc_coverage: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}coverage"
+  dc_rights: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}rights"
+  resumption_token: "{http://www.openarchives.org/OAI/2.0/}ListRecords/{http://www.openarchives.org/OAI/2.0/}resumptionToken"
