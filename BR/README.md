@@ -1,116 +1,213 @@
-# Scraper para Embrapa (Brasil)
+# Scraper para Publicaciones de Embrapa (Brasil)
 
-Este scraper está diseñado para recolectar información sobre publicaciones del portal de Embrapa, la Empresa Brasileña de Investigación Agropecuaria.
+Este scraper está diseñado para recolectar información sobre publicaciones de Embrapa, el organismo de investigación agrícola de Brasil. Utiliza una combinación de cosecha vía OAI-PMH de los repositorios institucionales Alice e Infoteca-e, y búsqueda por palabras clave en el portal principal de Embrapa.
 
 ## Características Principales
 
-- **Estrategia de Recolección Dual:** Utiliza tanto OAI-PMH (para los repositorios Alice e Infoteca-e) como búsqueda por palabras clave en el portal principal de Embrapa para descubrir publicaciones.
-- **Extracción de Metadatos:** Extrae metadatos detallados de los registros OAI y, si es necesario, de las páginas HTML de los ítems.
-- **Descarga de PDFs:** Gestiona la descarga de los archivos PDF asociados a las publicaciones.
-- **Gestión de Estado con SQLite:** Utiliza una base de datos SQLite para llevar un registro de los ítems procesados, su estado, los metadatos y los archivos descargados, asegurando la idempotencia y permitiendo la reanudación del proceso.
-- **Configuración Flexible:** Permite configurar diversos parámetros de operación, como los repositorios a consultar, límites de registros, y comportamiento de la descarga.
-- **Logging Detallado:** Genera un log detallado de todas las operaciones, errores y decisiones tomadas.
-- **Reportes:** Puede generar reportes en formato JSON sobre el estado del procesamiento y los resultados de las pruebas de descarga.
+*   **Doble Estrategia de Cosecha:**
+    *   **OAI-PMH:** Interactúa con los endpoints OAI-PMH de los repositorios Alice (`https://www.alice.cnptia.embrapa.br/alice-oai/request`) e Infoteca-e (`https://www.infoteca.cnptia.embrapa.br/infoteca-oai/request`) para obtener listados de registros y metadatos estructurados (Dublin Core). Esta es la vía preferida para obtener información robusta y completa.
+    *   **Búsqueda por Palabras Clave:** Realiza búsquedas en `https://www.embrapa.br/busca-de-publicacoes` para encontrar publicaciones relevantes a las palabras clave configuradas. Esta vía utiliza Selenium para interactuar con el formulario de búsqueda y paginar los resultados.
+*   **Extracción de Metadatos:**
+    *   Para ítems OAI, parsea los metadatos Dublin Core (título, autores, fechas, resumen, identificadores, etc.).
+    *   Para ítems de búsqueda por palabra clave, descarga el HTML de la página del ítem y extrae metadatos utilizando selectores XPath definidos en `BR/selectors.yaml`.
+*   **Descarga de PDFs:**
+    *   Identifica enlaces directos a PDFs a partir de los metadatos OAI (`dc:identifier` que son URLs de PDF) o los extrae de las páginas HTML de los ítems.
+    *   Descarga los PDFs y los organiza en directorios locales.
+*   **Gestión de Estado con SQLite:**
+    *   Utiliza una base de datos SQLite (`BR/db/scraper_br.db`) para llevar un registro de todos los ítems procesados, su estado (ej. `pending_html_processing`, `pending_pdf_link`, `awaiting_pdf_download`, `processed`, `error_...`), metadatos, y la ubicación de los archivos descargados (HTML snapshots, PDFs).
+    *   Esto permite la reanudación del scraper y evita el reprocesamiento de ítems ya completados.
+*   **Configuración Flexible:**
+    *   La configuración principal se encuentra dentro de `BR/scraper.py` en el diccionario `DEFAULT_CONFIG_BR`.
+    *   Los selectores XPath para el parseo HTML se definen en `BR/selectors.yaml`.
+*   **Generación de Reportes:**
+    *   `BR/output/state_br.json`: Un archivo JSON que contiene un resumen del estado de todos los ítems procesados, incluyendo sus metadatos y la información de los PDFs asociados.
+    *   `BR/output/test_results_br.json`: Un archivo JSON con detalles de una muestra de PDFs descargados, incluyendo su hash MD5 y metadatos básicos.
+*   **Logging Detallado:**
+    *   Registra el progreso, las decisiones clave, y los errores en `BR/logs/BR-SCRAPER.log`.
 
-## Estructura del Proyecto (Directorio `BR/`)
+## Estructura del Proyecto
 
-- `scraper.py`: Script principal que orquesta todo el proceso de scraping.
-- `database_manager_br.py`: Gestiona la interacción con la base de datos SQLite.
-- `html_metadata_extractor_br.py`: Extrae metadatos de páginas HTML (si es necesario como complemento a OAI).
-- `keyword_searcher_br.py`: Implementa la lógica de búsqueda por palabras clave en el portal web.
-- `oai_harvester_br.py`: Implementa la lógica para cosechar metadatos desde endpoints OAI-PMH.
-- `resource_downloader_br.py`: Maneja la descarga de recursos (PDFs, snapshots HTML).
-- `selectors.yaml`: Contiene los selectores XPath/CSS para extraer información de las páginas HTML.
-- `requirements.txt`: Lista las dependencias de Python necesarias.
-- `README.md`: Este archivo.
-- `db/`: Directorio donde se almacena la base de datos SQLite (ej. `scraper_br.db`).
-- `logs/`: Directorio para los archivos de log (ej. `BR-SCRAPER.log`).
-- `output/`: Directorio para los archivos generados por el scraper:
-    - `pdfs/`: Almacena los PDFs descargados, organizados por ID de ítem.
-    - `html_snapshot/`: Almacena snapshots HTML de las páginas de ítems (si se configura).
-    - `state_br.json`: Archivo JSON con el estado general del scraping.
-    - `test_results_br.json`: Resultados de las pruebas de descarga y verificación.
-- `output_package/`: (Si se ejecuta la tarea de empaquetado final) Contiene una versión empaquetada del scraper y sus resultados.
+```
+BR/
+├── db/
+│   └── scraper_br.db         # Base de datos SQLite
+├── docs/
+│   └── sample_pdfs/          # PDFs de muestra para verificación (se copian aquí)
+├── logs/
+│   └── BR-SCRAPER.log        # Archivo de log principal
+├── output/
+│   ├── html_snapshot/        # Snapshots HTML guardados (para ítems de búsqueda por palabra clave)
+│   │   └── <item_id>/...html
+│   ├── pdfs/                 # PDFs descargados
+│   │   └── <item_id>/...pdf
+│   ├── state_br.json         # Reporte de estado de todos los ítems
+│   └── test_results_br.json  # Reporte de verificación de PDFs de muestra
+├── output_package/           # Directorio para el paquete final (manual)
+├── __init__.py
+├── oai_harvester_br.py       # Lógica para la cosecha OAI-PMH
+├── database_manager_br.py    # Gestión de la base de datos SQLite
+├── resource_downloader_br.py # Descarga de recursos (PDFs, HTML)
+├── html_metadata_extractor_br.py # Extracción de metadatos desde HTML
+├── keyword_searcher_br.py    # Lógica para búsqueda por palabra clave y Selenium
+├── scraper.py                # Script principal del scraper y orquestación
+├── selectors.yaml            # Selectores XPath para parseo HTML
+└── requirements.txt          # Dependencias de Python
+```
 
-## Instalación y Configuración
+## Requisitos
 
-1.  **Clonar el Repositorio:**
+*   Python 3.7+
+*   Google Chrome (o Chromium) instalado (para la búsqueda por palabra clave con Selenium)
+*   ChromeDriver compatible con la versión de Chrome/Chromium instalado y accesible en el PATH del sistema, o su ruta especificada en la configuración (`chromedriver_path`).
+
+## Instalación
+
+1.  **Clonar el Repositorio (si aplica):**
     ```bash
-    git clone <URL_DEL_REPOSITORIO>
-    cd <NOMBRE_DEL_REPOSITORIO>
+    # git clone ...
+    # cd BR-scraper-directory 
     ```
-2.  **Crear y Activar un Entorno Virtual (Recomendado):**
+
+2.  **Crear un Entorno Virtual (Recomendado):**
     ```bash
     python3 -m venv .venv
-    source .venv/bin/activate
+    source .venv/bin/activate 
     ```
+
 3.  **Instalar Dependencias:**
-    Asegúrate de que todas las dependencias listadas en `BR/requirements.txt` estén instaladas. Puedes instalarlas con:
     ```bash
     pip install -r BR/requirements.txt
     ```
-    Las dependencias típicas incluyen: `requests`, `lxml`, `PyYAML`, `cssselect`, `python-dateutil`, `selenium`.
 
-4.  **Configuración Inicial:**
-    El script `BR/scraper.py` contiene una configuración por defecto (`DEFAULT_CONFIG_BR`). Puedes modificarla directamente en el script o, idealmente, adaptarla para que cargue configuraciones desde un archivo externo si se requiere mayor flexibilidad para diferentes ejecuciones.
-    Los parámetros clave a revisar son:
-    - URLs de los repositorios OAI (`oai_repositories`).
-    - URL base para búsquedas por palabra clave (`search_config`).
-    - Límites de registros a procesar (`max_records_oai`, `max_items_keyword_search`).
-    - Rutas de archivos y directorios.
+4.  **Configurar ChromeDriver (si es necesario):**
+    *   Asegúrate de que ChromeDriver esté en tu PATH.
+    *   Alternativamente, puedes editar `BR/scraper.py` y establecer la variable `chromedriver_path` dentro de `DEFAULT_CONFIG_BR` a la ruta absoluta de tu ejecutable ChromeDriver. Por defecto es `None`, lo que implica que Selenium intentará encontrarlo en el PATH.
+
+## Configuración
+
+El scraper se configura principalmente a través del diccionario `DEFAULT_CONFIG_BR` en el archivo `BR/scraper.py`. Algunas configuraciones clave incluyen:
+
+*   **Límites de Cosecha OAI:**
+    *   `max_oai_records_alice`: Número máximo de registros a cosechar de Alice (ej. `20`). Poner en `None` para ilimitado.
+    *   `max_oai_records_infoteca`: Número máximo de registros a cosechar de Infoteca-e (ej. `20`). Poner en `None` para ilimitado.
+*   **Búsqueda por Palabras Clave:**
+    *   `keyword_search_keywords`: Lista de palabras clave a buscar (ej. `["maiz", "soja"]`). Dejar vacío `[]` para omitir.
+    *   `keyword_max_pages`: Número máximo de páginas de resultados a procesar por palabra clave.
+*   **Límites de Procesamiento de Ítems:**
+    *   `max_html_processing_items`: Máximo de ítems a procesar para extracción de metadatos HTML por ejecución.
+    *   `max_pdf_link_extraction_items`: Máximo de ítems a procesar para extracción de enlaces PDF por ejecución.
+    *   `max_pdf_download_items`: Máximo de PDFs a descargar por ejecución.
+*   **Delays:**
+    *   `oai_request_delay`: Segundos de espera entre peticiones OAI.
+    *   `download_delay_seconds`: Segundos de espera entre descargas de archivos.
+*   **Rutas de Archivos y Directorios:** Definidas para logs, base de datos, salidas, etc.
+
+Los selectores XPath para la extracción de metadatos de páginas HTML (usados por `KeywordSearcherBR` y `HTMLMetadataExtractorBR`) se encuentran en `BR/selectors.yaml`.
 
 ## Ejecución del Scraper
 
-Para ejecutar el scraper desde la raíz del proyecto:
+1.  **Asegúrate de que el entorno virtual esté activado** (si usaste uno).
+2.  **Desde el directorio raíz del proyecto (donde está el directorio `BR/`), ejecuta el scraper usando el módulo:**
+    ```bash
+    python3 -m BR.scraper
+    ```
+3.  **Para una prueba limpia, especialmente después de cambios significativos o para probar la cosecha OAI desde cero, se recomienda borrar la base de datos:**
+    ```bash
+    # rm BR/db/scraper_br.db  # (Opcional, pero recomendado para pruebas limpias)
+    # python3 -m BR.scraper
+    ```
 
-```bash
-python3 -m BR.scraper
-```
+El scraper registrará su progreso en la consola y en el archivo `BR/logs/BR-SCRAPER.log`.
 
-Esto iniciará el proceso de scraping según la configuración definida. El scraper primero intentará cosechar vía OAI-PMH, y luego (si está configurado) realizará búsquedas por palabras clave.
+## Flujo del Scraper
 
-### Opciones de Ejecución (Ejemplos a implementar/considerar)
+1.  **Inicialización:** Carga configuración, inicializa logging y componentes (DB manager, OAI harvester, etc.).
+2.  **Cosecha OAI-PMH (si está configurada):**
+    *   Para cada repositorio OAI activado (Alice, Infoteca-e):
+        *   Realiza peticiones OAI para obtener registros.
+        *   Parsea los metadatos Dublin Core.
+        *   Identifica la URL de la página del ítem y, si está disponible, una URL directa al PDF.
+        *   Registra los ítems y sus metadatos en la base de datos con estado inicial `pending_pdf_link`.
+3.  **Búsqueda por Palabras Clave (si está configurada):**
+    *   Para cada palabra clave:
+        *   Utiliza Selenium y ChromeDriver para navegar a `https://www.embrapa.br/busca-de-publicacoes`, ingresar la palabra clave y enviar el formulario.
+        *   Itera sobre las páginas de resultados.
+        *   Extrae las URLs de las páginas de los ítems individuales.
+        *   Registra los nuevos ítems en la base de datos con estado inicial `pending_html_processing`.
+4.  **Procesamiento de HTML y Metadatos:**
+    *   Busca en la base de datos ítems con estado `pending_html_processing`.
+    *   Para cada uno:
+        *   Descarga (o usa snapshot si ya existe) el contenido HTML de la página del ítem.
+        *   Utiliza `HTMLMetadataExtractorBR` y `BR/selectors.yaml` para extraer metadatos (título, autores, etc.).
+        *   Guarda los metadatos y actualiza el estado del ítem a `pending_download`.
+5.  **Extracción de Enlaces PDF:**
+    *   Busca ítems con estado `pending_download`.
+    *   Para cada uno:
+        *   Si los metadatos ya contienen un `pdf_direct_url` (proveniente de OAI), se usa ese.
+        *   De lo contrario (típicamente para ítems de búsqueda por palabra clave), intenta extraer un enlace PDF desde el HTML de la página del ítem (si no se hizo ya o si el `item_page_url` no es un PDF en sí mismo).
+        *   Si se encuentra un enlace PDF, se actualizan los metadatos del ítem y su estado cambia a `awaiting_pdf_download`.
+6.  **Descarga de PDFs:**
+    *   Busca ítems con estado `awaiting_pdf_download`.
+    *   Para cada uno, descarga el archivo PDF referenciado por `pdf_direct_url`.
+    *   Calcula el hash MD5 y el tamaño del archivo.
+    *   Actualiza la base de datos con la ruta local, el hash, el tamaño y cambia el estado a `processed`.
+7.  **Generación de Reportes Finales:**
+    *   Crea/actualiza `BR/output/state_br.json` con el resumen de todos los ítems.
+    *   Crea/actualiza `BR/output/test_results_br.json` con una muestra de los PDFs descargados.
 
-Podrías extender el scraper para aceptar argumentos de línea de comando, por ejemplo:
+## Desafíos Superados
 
-- Para ejecutar solo la cosecha OAI:
-  `python3 -m BR.scraper --source oai`
-- Para buscar una palabra clave específica:
-  `python3 -m BR.scraper --keyword "inteligencia artificial" --source keyword`
-- Para limitar el número de registros:
-  `python3 -m BR.scraper --max-records 100`
+*   **Integración de dos fuentes de datos:** Se implementó tanto la cosecha OAI-PMH (preferida) como la búsqueda por palabras clave con Selenium para maximizar la cobertura.
+*   **Parseo de Respuestas OAI:** Se desarrolló lógica para manejar las respuestas XML de los endpoints OAI, incluyendo la extracción de metadatos Dublin Core y la identificación de URLs de ítems y PDFs directos. Inicialmente hubo problemas para identificar correctamente los `item_page_url` y parsear los metadatos de todos los repositorios, lo que se solucionó refinando los XPaths y la lógica de extracción de identificadores.
+*   **Manejo de Búsqueda Web con Selenium:** Se implementó el uso de Selenium para la interacción con el formulario de búsqueda de Embrapa, incluyendo esperas explícitas para asegurar la carga de contenido dinámico.
+*   **Flujo de Estados de Ítems:** Se definió un flujo de estados claro para cada ítem, gestionado a través de la base de datos, para permitir el procesamiento por etapas y la reanudabilidad.
+*   **Identificación de Enlaces PDF:** Se refinó la lógica para obtener enlaces PDF tanto de los metadatos OAI (donde a veces el `dc:identifier` es el PDF mismo) como de la extracción de contenido HTML.
 
-## Flujo del Proceso
+## Salidas del Scraper
 
-1.  **Inicialización:** Carga la configuración, inicializa el logger y el gestor de base de datos.
-2.  **Cosecha OAI (si está habilitada):**
-    - Itera sobre los repositorios OAI configurados (Alice, Infoteca-e).
-    - Realiza peticiones OAI-PMH (`ListRecords`) para obtener metadatos.
-    - Parsea las respuestas XML y extrae los metadatos Dublin Core.
-    - Registra cada ítem en la base de datos con estado `pending_pdf_link`.
-3.  **Búsqueda por Palabras Clave (si está habilitada):**
-    - Construye URLs de búsqueda para el portal de Embrapa.
-    - Utiliza Selenium (o una librería HTTP) para obtener las páginas de resultados.
-    - Parsea los resultados para identificar ítems individuales.
-    - Para cada ítem encontrado, intenta extraer un enlace a su página de detalles.
-    - Registra cada ítem en la base de datos con estado `pending_html_processing` (o directamente `pending_pdf_link` si se puede obtener el PDF de inmediato).
-4.  **Procesamiento de HTML y Extracción de Enlaces PDF (para ítems pendientes):**
-    - Itera sobre los ítems en la base de datos cuyo estado requiera procesamiento HTML (ej. `pending_html_processing` o `pending_pdf_link` si el enlace PDF no se obtuvo directamente de OAI).
-    - Descarga la página HTML del ítem.
-    - Utiliza `HTMLMetadataExtractorBR` y los selectores de `selectors.yaml` para extraer el enlace directo al PDF.
-    - Actualiza el ítem en la base de datos con el enlace al PDF y cambia su estado a `pending_pdf_download`.
-5.  **Descarga de PDFs:**
-    - Itera sobre los ítems en estado `pending_pdf_download`.
-    - Utiliza `ResourceDownloaderBR` para descargar el archivo PDF.
-    - Calcula el hash MD5 del archivo descargado.
-    - Actualiza el ítem en la base de datos con la ruta local, el hash MD5, y cambia su estado a `processed` o `download_failed`.
-6.  **Generación de Reportes:** Al finalizar, puede generar archivos JSON (`state_br.json`, `test_results_br.json`) con un resumen del proceso y los resultados.
+*   **Archivos PDF:** Descargados en `BR/output/pdfs/<item_id>/<nombre_archivo.pdf>`
+*   **Snapshots HTML:** (Para ítems de búsqueda por palabra clave) Guardados en `BR/output/html_snapshot/<item_id>/<item_id>_snapshot.html`
+*   **Logs:** `BR/logs/BR-SCRAPER.log`
+*   **Base de Datos:** `BR/db/scraper_br.db`
+*   **Reporte de Estado:** `BR/output/state_br.json`
+    ```json
+    [
+        {
+            "url": "http://www.alice.cnptia.embrapa.br/alice/handle/doc/105403",
+            "metadata": {
+                "title": "Título del Documento Ejemplo",
+                "authors": ["Autor Uno", "Autor Dos"],
+                "publication_date": "2023-01-15"
+            },
+            "html_path": null, // o "BR/output/html_snapshot/123/123_snapshot.html"
+            "pdfs": [
+                {
+                    "url": "http://www.alice.cnptia.embrapa.br/alice/bitstream/doc/105403/1/Pab8901.pdf",
+                    "local_path": "BR/output/pdfs/41/Pab8901.pdf",
+                    "downloaded": true
+                }
+            ],
+            "analyzed": true // true si el estado es "processed"
+        },
+        // ... más ítems
+    ]
+    ```
+*   **Resultados de Pruebas de PDF:** `BR/output/test_results_br.json`
+    ```json
+    [
+        {
+            "item_page_url": "http://www.alice.cnptia.embrapa.br/alice/handle/doc/105403",
+            "local_pdf_path": "BR/output/pdfs/41/Pab8901.pdf",
+            "md5_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            "file_size_bytes": 1234567,
+            "metadata": {
+                "title": "Título del Documento Ejemplo",
+                "authors": ["Autor Uno", "Autor Dos"],
+                "publication_date": "2023-01-15"
+            }
+        },
+        // ... más resultados de prueba
+    ]
+    ```
 
-## Desafíos y Consideraciones
-
-- **Mantenimiento de Selectores:** Los selectores HTML (XPath/CSS) pueden romperse si la estructura del sitio web de Embrapa cambia. Necesitarán ser revisados y actualizados periódicamente.
-- **Bloqueos y Medidas Anti-Scraping:** Aunque OAI-PMH es robusto, el scraping de páginas HTML puede encontrar medidas anti-scraping. El uso de Selenium y la simulación de comportamiento humano (retrasos, user-agents) pueden ayudar a mitigar esto.
-- **Variedad de Formatos y Estructuras:** Las diferentes secciones y repositorios de Embrapa podrían tener estructuras de metadatos o formatos de página ligeramente diferentes.
-- **Manejo de Grandes Volúmenes de Datos:** Para una recolección exhaustiva, se deben considerar optimizaciones en el manejo de memoria y las operaciones de base de datos.
-
-Este `README.md` proporciona una visión general. El código fuente de cada módulo contiene la lógica detallada de implementación.
+Este README debería proporcionar una buena base. 
