@@ -1,518 +1,586 @@
-import logging
-import json
-import os
+# BR/scraper.py
 import argparse
-import yaml # For loading selectors and potentially config
-from datetime import datetime
-
-# Import an_scraper classes
-from .database_manager_br import DatabaseManagerBR, FILE_DOWNLOAD_SUCCESS, FILE_TYPE_PDF, STATUS_PROCESSED, STATUS_PENDING_PDF_DOWNLOAD, STATUS_PENDING_HTML_PROCESSING, STATUS_PENDING_PDF_LINK
-from .html_metadata_extractor_br import HTMLMetadataExtractorBR
-from .resource_downloader_br import ResourceDownloaderBR
-from .keyword_searcher_br import KeywordSearcherBR
+import logging
+import os
+import yaml
+import json
+import time
+import sqlite3 # Importar sqlite3 para la consulta de depuración
+import shutil # Importar shutil para copiar archivos
 from .oai_harvester_br import OAIHarvesterBR
+from .database_manager_br import DatabaseManagerBR
+from .resource_downloader_br import ResourceDownloaderBR
+from .html_metadata_extractor_br import HTMLMetadataExtractorBR
+from .keyword_searcher_br import KeywordSearcherBR
 
-# Default configuration (can be overridden by a config file or command-line args)
 DEFAULT_CONFIG_BR = {
     "base_url": "https://www.embrapa.br",
+    # URLs base de los repositorios (no necesariamente OAI endpoints)
+    "base_url_alice_repo": "https://www.alice.cnptia.embrapa.br/alice/",
+    "base_url_infoteca_repo": "https://www.infoteca.cnptia.embrapa.br/infoteca/",
+    "base_url_embrapa_search": "https://www.embrapa.br/busca-de-publicacoes",
     "country_code": "BR",
     "db_file": "BR/db/scraper_br.db",
     "log_file": "BR/logs/BR-SCRAPER.log",
-    "log_level": "INFO", # DEBUG, INFO, WARNING, ERROR, CRITICAL
-    "user_agent": "Mozilla/5.0 (compatible; EmbrapaScraper/1.0; +http://example.com/botinfo.html)",
-    
-    "base_output_directory": "BR/output",
-    "pdf_subdirectory": "pdfs",
-    "html_snapshot_subdirectory": "html_snapshots",
-    "state_file_json": "BR/output/state_br.json",
-    "test_results_file_json": "BR/output/test_results_br.json", # For VERIFY task compliance
-    "sample_pdfs_dir_for_doc": "BR/docs/sample_pdfs/", # For DOC task compliance
-
-    "selectors_file": "BR/selectors.yaml",
-
-    "oai_harvesting_enabled": True,
-    "oai_repositories": [
-        {
-            "name": "alice",
-            "base_url": "https://www.alice.cnptia.embrapa.br/oai/request",
-            "metadata_prefix": "oai_dc",
-            # "set_spec": "com_123456789_1" # Example: filter by a specific set if needed
+    "output_dir": "BR/output",
+    "repositories": {
+        "alice": {
+            "name": "Alice",
+            "url_base": "https://www.alice.cnptia.embrapa.br/alice/",
+            "oai_pmh_endpoint": "https://www.alice.cnptia.embrapa.br/alice-oai/request", # Endpoint corregido
+            "preferred_metadata_prefix": "oai_dc",
+            "set_spec": None # Sin set específico por ahora
         },
-        {
-            "name": "infoteca-e",
-            "base_url": "https://www.infoteca.cnptia.embrapa.br/infoteca/oai",
-            "metadata_prefix": "oai_dc"
-        }
-    ],
-    "max_records_oai_per_repo": 20, # Max records to fetch per OAI repo (set low for testing)
-    "oai_request_timeout": 60, # seconds
-    "oai_request_delay_seconds": 3,
-
-    "keyword_searching_enabled": True,
-    "keywords_to_search": ["milho", "soja", "inteligência artificial"], # Corn, Soya, AI
-    "search_config": {
-        "base_url": "https://www.embrapa.br/busca-de-publicacoes", # From analysis
-        "query_param": "_resultadoBuscaPortlet_WAR_buscaportlet_q",
-        "pagination_param": "_resultadoBuscaPortlet_WAR_buscaportlet_cur",
-        "start_page_number": 1,
-        "max_search_pages_per_keyword": 2, # Max search result pages to crawl per keyword
-        "search_delay_seconds": 5,
-        "selenium_timeout": 45,
-        "repository_source_keyword_search": "embrapa_portal_search",
-        "fixed_params": { # Parameters that seem fixed in Embrapa's search URL structure
-            "p_p_id": "resultadoBuscaPortlet_WAR_buscaportlet",
-            "p_p_lifecycle": "0",
-            "p_p_state": "normal",
-            "p_p_mode": "view",
-            "p_p_col_id": "column-1",
-            "p_p_col_count": "1",
-            "_resultadoBuscaPortlet_WAR_buscaportlet_delta": "10" # Results per page
+        "infoteca-e": {
+            "name": "Infoteca-e",
+            "url_base": "https://www.infoteca.cnptia.embrapa.br/infoteca/",
+            "oai_pmh_endpoint": "https://www.infoteca.cnptia.embrapa.br/infoteca-oai/request", # Endpoint corregido
+            "preferred_metadata_prefix": "oai_dc",
+            "set_spec": None # Sin set específico por ahora
         }
     },
-    "webdriver_path": "chromedriver", # Path to chromedriver executable, or just 'chromedriver' if in PATH
-
-    "process_html_for_pdf_link_limit": 50, # Max items to process from DB for PDF link extraction per run
-    "download_pdfs_limit": 20, # Max PDFs to download per run
-    "download_retries": 3,
-    "download_delay_retry_seconds": 10,
-    "download_timeout_seconds": 180, # Longer timeout for potentially large PDF files
-
+    "primary_harvest_repository": "all", # Procesar todos los repositorios configurados
+    "download_delay_seconds": 1, # Reducido ligeramente
+    "max_retries": 3,
+    "user_agent": "EmbrapaScraper/1.0 (Compatible; +http://example.com/botinfo)",
+    "selectors_file": "BR/selectors.yaml",
+    "download_timeout": 120,
+    "request_timeout": 60, 
+    "download_base_retry_delay": 5, 
+    "delay": 0.1, 
+    "oai_request_delay": 2, # Segundos de espera entre peticiones OAI
+    "max_oai_records_alice": 20, # Límite para prueba OAI Alice
+    "max_oai_records_infoteca": 20, # Límite para prueba OAI Infoteca
+    "max_html_processing_items": 20,
+    "max_pdf_link_extraction_items": 20, 
+    "max_pdf_download_items": 20, 
+    "download_batch_size": 5, # Aumentado ligeramente
+    "output_state_file": "BR/output/state_br.json",
+    "output_test_results_file": "BR/output/test_results_br.json",
+    "docs_sample_pdfs_dir": "BR/docs/sample_pdfs/",
+    "log_level": "INFO", 
+    "timeout_seconds": 60,
+    "keyword_search_keywords": ["maiz"], # Mantener o comentar según preferencia
+    "keyword_max_pages": 3, 
+    "keyword_search_items_per_page": 10, 
+    "keyword_search_order_by": "relevancia-ordenacao",
+    "keyword_search_direction": "asc",
+    "concurrency_level": 5,
+    "use_snapshots_for_html_processing": True, 
+    "selenium_wait_timeout": 60, 
     "generate_state_json": True,
-    "generate_test_results_json": True, # For VERIFY task, create a small sample
-    "max_items_for_test_results": 5, # Number of successfully downloaded PDFs for test_results.json
+    "generate_test_results_json": True,
+    "test_results_sample_size": 5, 
+    "chromedriver_path": None,
 }
 
 class ScraperBR:
-    """
-    Main class for the Embrapa (Brazil) Scraper.
-    Orchestrates the OAI harvesting, keyword searching, metadata extraction, 
-    resource downloading, and database management.
-    """
-
     def __init__(self, config):
-        """
-        Initializes the ScraperBR with a given configuration.
-        """
         self.config = config
-        self.logger = self._setup_logger()
+        self.logger = self._setup_logging()
         self.selectors = self._load_selectors()
-        self.db_manager = DatabaseManagerBR(config['db_file'], logger=self.logger)
-        self.downloader = ResourceDownloaderBR(config, logger=self.logger, db_manager=self.db_manager)
-        self.html_extractor = HTMLMetadataExtractorBR(config, logger=self.logger, downloader=self.downloader)
-        self.oai_harvester = OAIHarvesterBR(config, logger=self.logger, db_manager=self.db_manager, selectors_dict=self.selectors)
-        self.keyword_searcher = KeywordSearcherBR(config, logger=self.logger, db_manager=self.db_manager, downloader=self.downloader, selectors_dict=self.selectors)
 
-        self._ensure_output_dirs_exist()
+        self.db_manager = DatabaseManagerBR(self.config['db_file'], self.logger)
+        self.db_manager.initialize_db() 
 
-    def _setup_logger(self):
-        """Configures and returns a logger instance."""
-        logger = logging.getLogger("ScraperBR")
-        level = logging.getLevelName(self.config.get('log_level', 'INFO').upper())
-        logger.setLevel(level)
+        # Pasar self.db_manager a ResourceDownloaderBR
+        self.downloader = ResourceDownloaderBR(self.config, self.logger, self.db_manager)
         
-        # Prevent multiple handlers if already configured (e.g., in tests or multiple runs)
+        self.oai_harvester = OAIHarvesterBR(self.config, self.logger, self.db_manager)
+        self.html_extractor = HTMLMetadataExtractorBR(self.config, self.logger, self.selectors, self.downloader)
+        self.keyword_searcher = KeywordSearcherBR(self.config, self.logger, self.db_manager, self.downloader, self.selectors)
+
+        self.logger.info("ScraperBR inicializado con todos los componentes principales.")
+
+    def _setup_logging(self):
+        logger = logging.getLogger("EmbrapaScraper")
+        logger.setLevel(logging.INFO)
+        # Crear directorio de logs si no existe
+        os.makedirs(os.path.dirname(self.config['log_file']), exist_ok=True)
+        # Handler para archivo
+        fh = logging.FileHandler(self.config['log_file'], mode='a')
+        fh.setLevel(logging.INFO)
+        # Handler para consola
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        # Formato
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
+        # Añadir handlers
         if not logger.handlers:
-            # File Handler
-            log_file_path = self.config['log_file']
-            log_dir = os.path.dirname(log_file_path)
-            if log_dir and not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
-            fh = logging.FileHandler(log_file_path, mode='a') # Append mode
-            fh.setLevel(level)
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
-            fh.setFormatter(formatter)
             logger.addHandler(fh)
-
-            # Console Handler (optional, for immediate feedback)
-            ch = logging.StreamHandler()
-            ch.setLevel(level) # Or a higher level like INFO for console
-            ch.setFormatter(formatter)
             logger.addHandler(ch)
-        
-        logger.info("Logger initialized.")
         return logger
 
     def _load_selectors(self):
-        """Loads XPath/CSS selectors from the YAML file specified in config."""
-        selectors_file_path = self.config.get('selectors_file')
-        if selectors_file_path and os.path.exists(selectors_file_path):
-            try:
-                with open(selectors_file_path, 'r', encoding='utf-8') as f:
-                    selectors = yaml.safe_load(f)
-                self.logger.info(f"Selectors loaded successfully from {selectors_file_path}")
-                return selectors
-            except yaml.YAMLError as e:
-                self.logger.error(f"Error parsing YAML selectors file {selectors_file_path}: {e}")
-            except IOError as e:
-                self.logger.error(f"Error reading selectors file {selectors_file_path}: {e}")
-        else:
-            self.logger.warning(f"Selectors file not found or not specified: {selectors_file_path}. Using empty selectors dict.")
-        return {} # Return empty dict if loading fails or no file specified
-
-    def _ensure_output_dirs_exist(self):
-        """Ensures that all configured base output directories exist."""
-        dirs_to_check = [
-            self.config['base_output_directory'],
-            os.path.join(self.config['base_output_directory'], self.config['pdf_subdirectory']),
-            os.path.join(self.config['base_output_directory'], self.config['html_snapshot_subdirectory']),
-            os.path.dirname(self.config.get('state_file_json', '')),
-            os.path.dirname(self.config.get('test_results_file_json', '')),
-            self.config.get('sample_pdfs_dir_for_doc')
-        ]
-        for dir_path in dirs_to_check:
-            if dir_path and not os.path.exists(dir_path):
-                try:
-                    os.makedirs(dir_path, exist_ok=True)
-                    self.logger.info(f"Created output directory: {dir_path}")
-                except OSError as e:
-                    self.logger.error(f"Error creating output directory {dir_path}: {e}")
+        try:
+            with open(self.config['selectors_file'], 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            self.logger.error(f"Archivo de selectores no encontrado en {self.config['selectors_file']}")
+            return {}
+        except yaml.YAMLError as e:
+            self.logger.error(f"Error al parsear el archivo de selectores YAML: {e}")
+            return {}
 
     def _run_oai_harvest(self):
-        """Runs the OAI harvesting process if enabled."""
-        if self.config.get('oai_harvesting_enabled', False):
-            self.logger.info("Starting OAI Harvesting Phase...")
-            try:
-                new_oai_items = self.oai_harvester.run_harvest()
-                self.logger.info(f"OAI Harvesting Phase completed. Found {new_oai_items} new items.")
-            except Exception as e:
-                self.logger.error(f"Error during OAI harvesting phase: {e}", exc_info=True)
-        else:
-            self.logger.info("OAI Harvesting is disabled in the configuration.")
+        """Ejecuta la cosecha OAI para los repositorios configurados."""
+        self.logger.info("Iniciando fase de cosecha OAI-PMH.")
+        repos_config = self.config.get('repositories', {})
+        target_repo_keys = []
+        primary_config = self.config.get('primary_harvest_repository', 'all')
 
-    def _run_keyword_search(self):
-        """Runs the keyword searching process if enabled."""
-        if self.config.get('keyword_searching_enabled', False):
-            self.logger.info("Starting Keyword Searching Phase...")
-            keywords = self.config.get('keywords_to_search', [])
-            if not keywords:
-                self.logger.warning("Keyword searching enabled, but no keywords provided in config.")
-                return
-            
-            total_new_keyword_items = 0
-            try:
-                for keyword in keywords:
-                    self.logger.info(f"Initiating search for keyword: '{keyword}'")
-                    total_new_keyword_items += self.keyword_searcher.search_by_keyword(keyword)
-            except Exception as e:
-                self.logger.error(f"Error during keyword searching phase: {e}", exc_info=True)
-            finally:
-                self.keyword_searcher.quit_webdriver() # Ensure webdriver is closed
-            self.logger.info(f"Keyword Searching Phase completed. Found {total_new_keyword_items} new items.")
+        if primary_config == 'all':
+            target_repo_keys = list(repos_config.keys())
+        elif primary_config in repos_config:
+            target_repo_keys = [primary_config]
         else:
-            self.logger.info("Keyword Searching is disabled in the configuration.")
+            self.logger.warning(f"Repositorio OAI primario '{primary_config}' no encontrado en la configuración.")
 
-    def _process_items_for_pdf_links(self):
-        """
-        Processes items from the database that are pending PDF link extraction.
-        These items typically come from OAI harvesting (status: pending_pdf_link) or 
-        keyword search if HTML needs full processing (status: pending_html_processing).
-        """
-        limit = self.config.get('process_html_for_pdf_link_limit', 50)
-        # Items from OAI might directly need PDF link extraction if not found in OAI record identifiers
-        # Items from keyword search are initially marked pending_html_processing, then might go to pending_pdf_link
-        statuses_to_process = [STATUS_PENDING_PDF_LINK, STATUS_PENDING_HTML_PROCESSING]
-        
-        items_to_process = self.db_manager.get_items_by_status(statuses_to_process, limit=limit)
-        if not items_to_process:
-            self.logger.info("No items found in DB needing PDF link extraction or HTML processing.")
+        if not target_repo_keys:
+            self.logger.info("No hay repositorios OAI configurados o seleccionados para cosechar. Saltando fase OAI.")
             return
 
-        self.logger.info(f"Found {len(items_to_process)} items for PDF link extraction/HTML processing.")
+        all_repo_stats = []
+        for repo_key in target_repo_keys:
+            max_records = self.config.get(f'max_oai_records_{repo_key}', None) # Buscar límite específico
+            if max_records == 0: # Si es 0, significa desactivado
+                 self.logger.info(f"Cosecha OAI desactivada para '{repo_key}' (límite 0 en config). Saltando.")
+                 continue
+                 
+            self.logger.info(f"--- Iniciando cosecha para repositorio: {repo_key} (Límite: {max_records or 'Todos'}) ---")
+            try:
+                repo_stats = self.oai_harvester.harvest_repository(repo_key, max_records_to_fetch=max_records)
+                self.logger.info(f"--- Cosecha para {repo_key} finalizada. Estadísticas: {repo_stats} ---")
+                all_repo_stats.append(repo_stats)
+            except Exception as e:
+                 self.logger.error(f"Error durante la cosecha OAI del repositorio '{repo_key}': {e}", exc_info=True)
+
+        self.logger.info("Fase de cosecha OAI-PMH completada.")
+        # Devolver un resumen de las estadísticas de todos los repositorios procesados
+        total_fetched_all_repos = sum(stat.get('fetched', 0) for stat in all_repo_stats)
+        total_processed_db_all_repos = sum(stat.get('processed_db', 0) for stat in all_repo_stats)
+        total_new_db_all_repos = sum(stat.get('new_db', 0) for stat in all_repo_stats)
+        total_updated_db_all_repos = sum(stat.get('updated_db', 0) for stat in all_repo_stats)
+        total_failed_all_repos = sum(stat.get('failed', 0) for stat in all_repo_stats)
+        
+        return {
+            "oai_total_fetched": total_fetched_all_repos,
+            "oai_total_processed_db": total_processed_db_all_repos,
+            "oai_total_new_items_db": total_new_db_all_repos,
+            "oai_total_metadata_updated_db": total_updated_db_all_repos,
+            "oai_total_harvest_failures": total_failed_all_repos,
+            "oai_repositories_processed_count": len(all_repo_stats)
+        }
+
+    def _process_items_for_pdf_links(self, max_items_to_process=None):
+        """Procesa ítems para extraer el enlace directo al PDF desde sus páginas HTML."""
+        self.logger.info("Iniciando proceso de extracción de enlaces PDF de páginas de ítems...")
+        # Estado que indica que los metadatos OAI fueron obtenidos y necesitamos el enlace al PDF
+        items_pending_pdf_link = self.db_manager.get_items_to_process(statuses=['pending_download'], limit=max_items_to_process)
+
+        if not items_pending_pdf_link:
+            self.logger.info("No hay ítems pendientes de extracción de enlace PDF.")
+            return
+
+        self.logger.info(f"Se procesarán {len(items_pending_pdf_link)} ítems para extracción de enlace PDF.")
         processed_count = 0
-        for item_row in items_to_process:
-            item_id = item_row['item_id']
-            item_page_url = item_row['item_page_url']
-            current_status = item_row['processing_status']
-            pdf_url_harvested = item_row['pdf_url_harvested'] # Already found in OAI or initial search
+        found_links_count = 0
+        failed_extraction_count = 0
 
-            self.logger.info(f"Processing item_id: {item_id}, URL: {item_page_url}, Current Status: {current_status}")
+        for item_data in items_pending_pdf_link:
+            item_id = item_data['item_id']
+            item_page_url = item_data['item_page_url']
+            oai_id = item_data.get('oai_identifier', 'N/A')
+            log_prefix = f"[ItemDB {item_id} / OAI {oai_id}]"
 
-            if pdf_url_harvested: # If PDF URL was already found (e.g. from OAI identifier)
-                self.logger.info(f"Item {item_id} already has a harvested PDF URL: {pdf_url_harvested}. Updating status for download.")
-                self.db_manager.log_item_metadata(item_id, pdf_url_harvested=pdf_url_harvested) # Ensure it's logged
-                self.db_manager.update_item_status(item_id, STATUS_PENDING_PDF_DOWNLOAD)
-                processed_count += 1
-                continue
+            self.logger.info(f"{log_prefix} Preparando para obtener enlace PDF para {item_page_url}")
+            self.db_manager.update_item_status(item_id, 'processing_pdf_link')
 
-            if not item_page_url:
-                self.logger.warning(f"Item {item_id} has no item_page_url. Cannot extract PDF link. Setting status to error.")
-                self.db_manager.update_item_status(item_id, 'processing_error_missing_url')
-                continue
-            
-            # Fetch HTML and extract PDF link using HTMLMetadataExtractorBR
-            # The extractor can fetch HTML itself if not provided
-            pdf_link = self.html_extractor.extract_pdf_link(item_page_url)
+            pdf_direct_url = None
+            # Verificar si pdf_direct_url ya vino de OAI
+            if item_data.get('metadata_json'):
+                try:
+                    current_metadata = json.loads(item_data['metadata_json'])
+                    if current_metadata.get('pdf_direct_url'):
+                        pdf_direct_url = current_metadata['pdf_direct_url']
+                        self.logger.info(f"{log_prefix} Enlace PDF encontrado directamente en metadatos OAI: {pdf_direct_url}")
+                except json.JSONDecodeError:
+                    self.logger.warning(f"{log_prefix} No se pudo parsear metadata_json para buscar pdf_direct_url preexistente.")
 
-            if pdf_link:
-                self.logger.info(f"Successfully extracted PDF link for item {item_id}: {pdf_link}")
-                self.db_manager.log_item_metadata(item_id, pdf_url_harvested=pdf_link)
-                self.db_manager.update_item_status(item_id, STATUS_PENDING_PDF_DOWNLOAD)
+            if not pdf_direct_url: # Si no vino de OAI, intentar extraerlo del HTML
+                self.logger.info(f"{log_prefix} No se encontró pdf_direct_url en metadatos OAI. Intentando extracción desde HTML: {item_page_url}")
+                # Solo intentar extracción HTML si item_page_url no parece ser ya un PDF
+                if item_page_url and not item_page_url.lower().endswith('.pdf'):
+                    pdf_direct_url = self.html_extractor.extract_pdf_link(item_page_url, item_id_for_log=str(item_id))
+                elif item_page_url and item_page_url.lower().endswith('.pdf'):
+                    # Si el item_page_url es un PDF, pero no se capturó como pdf_direct_url antes (caso raro)
+                    self.logger.info(f"{log_prefix} item_page_url ya es un enlace PDF: {item_page_url}. Usándolo directamente.")
+                    pdf_direct_url = item_page_url
+                else:
+                    self.logger.warning(f"{log_prefix} item_page_url no es válido para extracción HTML: {item_page_url}")
+
+            if pdf_direct_url:
+                found_links_count += 1
+                self.logger.info(f"{log_prefix} Enlace PDF final para descarga: {pdf_direct_url}")
+                
+                # Actualizar metadata_json del ítem con este nuevo enlace
+                # Primero, obtener metadatos existentes si los hay
+                existing_metadata = {}
+                current_item_details = self.db_manager.get_item_details(item_id)
+                if current_item_details and current_item_details.get('metadata_json'):
+                    try:
+                        existing_metadata = json.loads(current_item_details['metadata_json'])
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"{log_prefix} No se pudo parsear metadata_json existente.")
+                
+                existing_metadata['pdf_direct_url'] = pdf_direct_url # Añadir o actualizar el enlace
+                
+                self.db_manager.log_item_metadata(item_id, existing_metadata)
+                self.db_manager.update_item_status(item_id, 'awaiting_pdf_download')
             else:
-                self.logger.warning(f"Failed to extract PDF link for item {item_id} from {item_page_url}. Status remains {current_status} or updated to error.")
-                # Optionally, change status to a specific error state like 'pdf_link_extraction_failed'
-                # For now, we leave it or db_manager can update based on attempts.
-                # If it was pending_html_processing, it might stay there, or go to a specific error.
-                # If it was pending_pdf_link, it indicates a failure to find the link from its page.
-                self.db_manager.update_item_status(item_id, 'error_pdf_link_not_found')
+                failed_extraction_count += 1
+                self.logger.warning(f"{log_prefix} No se pudo extraer el enlace PDF de {item_page_url}")
+                self.db_manager.update_item_status(item_id, 'error_pdf_link_extraction')
+            
             processed_count += 1
-        self.logger.info(f"Finished processing {processed_count} items for PDF links.")
+            if self.config.get('delay', 0.1) > 0: # Aplicar un pequeño delay
+                time.sleep(self.config.get('delay', 0.1) / 2) # Menor delay para esto que para OAI completo
 
-    def _download_pending_pdfs(self):
-        """Downloads PDF files for items that are pending download."""
-        limit = self.config.get('download_pdfs_limit', 20)
-        items_to_download = self.db_manager.get_items_by_status(STATUS_PENDING_PDF_DOWNLOAD, limit=limit)
-        
+    def _download_pdf_files(self, max_items_to_process=None):
+        """Descarga los archivos PDF para los ítems marcados como 'awaiting_pdf_download'."""
+        self.logger.info("Iniciando fase de descarga de PDFs...")
+        items_to_download = self.db_manager.get_items_to_process(statuses=['awaiting_pdf_download'], limit=max_items_to_process)
+
         if not items_to_download:
-            self.logger.info("No items found in DB pending PDF download.")
+            self.logger.info("No hay ítems esperando descarga de PDF.")
             return
 
-        self.logger.info(f"Found {len(items_to_download)} items pending PDF download.")
-        downloaded_count = 0
-        for item_row in items_to_download:
-            item_id = item_row['item_id']
-            # The PDF URL should have been stored in 'pdf_url_harvested' field by previous step
-            pdf_url = item_row['pdf_url_harvested'] 
+        self.logger.info(f"Se intentará descargar PDFs para {len(items_to_download)} ítems.")
+        successful_downloads = 0
+        failed_downloads = 0
 
-            if not pdf_url:
-                self.logger.error(f"Item {item_id} is pending PDF download, but has no pdf_url_harvested. Setting to error.")
-                self.db_manager.update_item_status(item_id, 'download_error_missing_url')
-                continue
+        for item_data in items_to_download:
+            item_id = item_data['item_id']
+            oai_id = item_data.get('oai_identifier', 'N/A')
+            log_prefix = f"[ItemDB {item_id} / OAI {oai_id}]"
             
-            self.logger.info(f"Attempting to download PDF for item {item_id} from URL: {pdf_url}")
-            success, local_path, md5, size = self.downloader.download_resource(item_id, pdf_url, FILE_TYPE_PDF)
+            pdf_url = None
+            current_metadata = {}
+            if item_data.get('metadata_json'):
+                try:
+                    current_metadata = json.loads(item_data['metadata_json'])
+                    pdf_url = current_metadata.get('pdf_direct_url')
+                except json.JSONDecodeError:
+                    self.logger.error(f"{log_prefix} No se pudo parsear metadata_json para obtener pdf_direct_url para descarga.")
+                    self.db_manager.update_item_status(item_id, 'error_pdf_download_metadata')
+                    failed_downloads += 1
+                    continue
+            
+            if not pdf_url:
+                self.logger.error(f"{log_prefix} No se encontró pdf_direct_url en metadatos para descarga. Marcando como error.")
+                self.db_manager.update_item_status(item_id, 'error_pdf_download_no_url')
+                failed_downloads += 1
+                continue
+
+            self.logger.info(f"{log_prefix} Intentando descargar PDF desde: {pdf_url}")
+            self.db_manager.update_item_status(item_id, 'processing_pdf_download')
+
+            file_id, success, local_path, md5_hash, file_size = self.downloader.download_pdf(item_id, pdf_url)
 
             if success:
-                self.logger.info(f"PDF for item {item_id} downloaded/verified: {local_path}")
-                # DB log for file is handled by downloader, now update item status
-                self.db_manager.update_item_status(item_id, STATUS_PROCESSED)
-                downloaded_count += 1
+                successful_downloads += 1
+                self.logger.info(f"{log_prefix} PDF descargado y registrado con file_id {file_id} en: {local_path}")
+                self.db_manager.update_item_status(item_id, 'processed_pdf_downloaded')
+                # Actualizar metadata_json con la info del archivo si es necesario (ya lo hace el downloader a través de log_file_result)
             else:
-                self.logger.error(f"Failed to download PDF for item {item_id} from {pdf_url}. Status logged by downloader.")
-                # Update item status to reflect download error
-                self.db_manager.update_item_status(item_id, 'download_error_failed_attempt')
+                failed_downloads += 1
+                self.logger.error(f"{log_prefix} Falló la descarga del PDF desde {pdf_url}. Detalles en logs anteriores.")
+                self.db_manager.update_item_status(item_id, 'error_pdf_download_failed')
+            
+            if self.config.get('delay', 0.1) > 0:
+                time.sleep(self.config.get('download_delay_seconds', 1)) # Delay de descarga entre archivos
         
-        self.logger.info(f"Finished PDF download phase. Successfully downloaded/verified {downloaded_count} PDFs.")
+        self.logger.info(f"Fase de descarga de PDFs completada. Éxitos: {successful_downloads}, Fallos: {failed_downloads}.")
 
     def _generate_state_json(self):
-        """Generates a JSON file summarizing the state of all processed items."""
-        if not self.config.get('generate_state_json', False):
-            self.logger.info("State JSON generation is disabled.")
+        if not self.config.get('generate_state_json', True):
+            self.logger.info("Generación de state.json desactivada.")
             return
 
-        state_file_path = self.config.get('state_file_json')
-        if not state_file_path:
-            self.logger.error("state_file_json path not configured. Cannot generate state JSON.")
-            return
+        self.logger.info("Generando archivo de estado JSON...")
+        output_file = self.config['output_state_file']
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-        self.logger.info(f"Generating state JSON file at: {state_file_path}")
-        all_items_data = []
+        items_data = []
         try:
-            # Fetch all items (or a representative sample if too many) for the state file
-            # This could be very large for a full scrape, consider criteria or sampling
-            # For now, fetching all might be slow but complete for smaller tests.
-            # A more scalable approach might be to query items page by page.
-            all_db_items = self.db_manager.conn.execute("SELECT * FROM items ORDER BY item_id DESC").fetchall()
+            # Consulta para obtener todos los ítems y sus archivos asociados
+            # Esto podría ser muy grande para una base de datos con muchos ítems.
+            # Considerar paginación o un resumen si es necesario.
+            conn = sqlite3.connect(self.config['db_file'])
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
             
-            for item_row in all_db_items:
-                item_data = dict(item_row) # Convert sqlite3.Row to dict
-                # Get associated files for this item
-                files_for_item = self.db_manager.get_files_for_item(item_row['item_id'])
-                item_data['files'] = [dict(f_row) for f_row in files_for_item]
-                # Convert timestamps to ISO format strings for JSON serialization
-                for key, value in item_data.items():
-                    if isinstance(value, datetime):
-                        item_data[key] = value.isoformat()
-                for file_entry in item_data['files']:
-                    for key, value in file_entry.items():
-                        if isinstance(value, datetime):
-                            file_entry[key] = value.isoformat()
-                all_items_data.append(item_data)
+            cursor.execute("SELECT * FROM items ORDER BY item_id DESC") # Tomar los más recientes primero
+            all_items = cursor.fetchall()
+            
+            for item_row in all_items:
+                item_dict = dict(item_row)
+                
+                # Cargar metadata_json si existe y es un JSON válido
+                if item_dict.get('metadata_json'):
+                    try:
+                        item_dict['metadata_json'] = json.loads(item_dict['metadata_json'])
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"[ItemDB {item_dict['item_id']}] metadata_json no es un JSON válido. Se mantendrá como string.")
+                
+                # Obtener archivos asociados
+                cursor.execute("SELECT * FROM files WHERE item_id = ?", (item_dict['item_id'],))
+                files_for_item = cursor.fetchall()
+                item_dict['files'] = [dict(f_row) for f_row in files_for_item]
+                
+                items_data.append(item_dict)
+            
+            conn.close()
 
-            with open(state_file_path, 'w', encoding='utf-8') as f:
-                json.dump(all_items_data, f, indent=4, ensure_ascii=False)
-            self.logger.info(f"State JSON file generated successfully with {len(all_items_data)} items.")
-
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(items_data, f, indent=4, ensure_ascii=False)
+            self.logger.info(f"Archivo de estado JSON generado en: {output_file} con {len(items_data)} ítems.")
+        except sqlite3.Error as e:
+            self.logger.error(f"Error de base de datos al generar state.json: {e}")
+            if conn: conn.close()
         except Exception as e:
-            self.logger.error(f"Error generating state JSON file: {e}", exc_info=True)
+            self.logger.error(f"Error al generar state.json: {e}", exc_info=True)
 
-    def _generate_test_results_json(self):
-        """
-        Generates a test_results.json file as per VERIFY task requirements.
-        Includes a small sample of successfully downloaded PDFs with their metadata.
-        """
-        if not self.config.get('generate_test_results_json', False):
-            self.logger.info("Test results JSON generation is disabled.")
+    def _generate_test_results_json(self, max_sample_pdfs=5):
+        if not self.config.get('generate_test_results_json', True):
+            self.logger.info("Generación de test_results.json desactivada.")
             return
 
-        test_results_file = self.config.get('test_results_file_json')
-        max_items_for_report = self.config.get('max_items_for_test_results', 5)
-        sample_pdfs_output_dir = self.config.get('sample_pdfs_dir_for_doc')
+        self.logger.info("Generando archivo de resultados de prueba JSON...")
+        output_file = self.config['output_test_results_file']
+        sample_dir = self.config['docs_sample_pdfs_dir']
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        if sample_dir:
+            os.makedirs(sample_dir, exist_ok=True)
 
-        if not test_results_file:
-            self.logger.error("test_results_file_json path not configured. Cannot generate test results.")
-            return
-        
-        self.logger.info(f"Generating test results JSON: {test_results_file}")
-        results_data = []
+        test_results = []
         try:
-            # Get items that are processed and have a successfully downloaded PDF
-            # Query items and their PDF files directly
-            query = f"""
-            SELECT i.item_id, i.title, i.publication_date, i.doi, i.item_page_url, f.local_path, f.md5_hash, f.file_size_bytes
+            conn = sqlite3.connect(self.config['db_file'])
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Seleccionar ítems que tienen un PDF descargado exitosamente
+            query = """
+            SELECT i.item_id, i.oai_identifier, i.item_page_url, i.metadata_json, f.local_path, f.md5_hash, f.file_size_bytes
             FROM items i
             JOIN files f ON i.item_id = f.item_id
-            WHERE i.processing_status = '{STATUS_PROCESSED}' 
-              AND f.file_type = '{FILE_TYPE_PDF}' 
-              AND f.download_status = '{FILE_DOWNLOAD_SUCCESS}'
-            ORDER BY i.item_id DESC -- Get recent ones
+            WHERE f.file_type = 'pdf' AND f.download_status = 'success'
+            ORDER BY i.item_id DESC -- Tomar de los más recientes
             LIMIT ?
             """
-            cursor = self.db_manager.conn.cursor()
-            processed_items_with_pdfs = cursor.execute(query, (max_items_for_report,)).fetchall()
+            cursor.execute(query, (max_sample_pdfs,))
+            items_with_pdfs = cursor.fetchall()
 
-            for item_row in processed_items_with_pdfs:
-                # Get authors for this item
-                cursor.execute("""
-                SELECT a.name FROM authors a
-                JOIN item_authors ia ON a.author_id = ia.author_id
-                WHERE ia.item_id = ?
-                """, (item_row['item_id'],))
-                authors = [row['name'] for row in cursor.fetchall()]
-
-                item_info = {
-                    "item_id_db": item_row['item_id'],
-                    "title": item_row['title'],
-                    "authors": authors,
-                    "publication_date": item_row['publication_date'],
-                    "doi": item_row['doi'],
-                    "source_url": item_row['item_page_url'],
-                    "local_pdf_path": item_row['local_path'],
-                    "md5_hash": item_row['md5_hash'],
-                    "file_size_bytes": item_row['file_size_bytes']
-                }
-                results_data.append(item_info)
-
-                # Copy this PDF to sample_pdfs_dir if it exists and sample dir is configured
-                if sample_pdfs_output_dir and item_row['local_path'] and os.path.exists(item_row['local_path']):
-                    self._ensure_output_dirs_exist() # Ensures sample_pdfs_dir_for_doc exists
+            for item_row in items_with_pdfs:
+                item_dict = dict(item_row)
+                metadata = {}
+                if item_dict.get('metadata_json'):
                     try:
-                        import shutil
-                        dest_file_name = f"item_{item_row['item_id']}_{os.path.basename(item_row['local_path'])}"
-                        dest_path = os.path.join(sample_pdfs_output_dir, dest_file_name)
-                        shutil.copy2(item_row['local_path'], dest_path)
-                        self.logger.info(f"Copied sample PDF for DOC task: {item_row['local_path']} to {dest_path}")
-                    except Exception as copy_e:
-                        self.logger.error(f"Failed to copy sample PDF {item_row['local_path']} to {sample_pdfs_output_dir}: {copy_e}")
-            
-            cursor.close()
-            with open(test_results_file, 'w', encoding='utf-8') as f:
-                json.dump(results_data, f, indent=4, ensure_ascii=False)
-            self.logger.info(f"Test results JSON generated with {len(results_data)} items.")
+                        metadata = json.loads(item_dict['metadata_json'])
+                    except json.JSONDecodeError:
+                        self.logger.warning(f"[ItemDB {item_dict['item_id']}] metadata_json no es un JSON válido para test_results.")
+                
+                result_entry = {
+                    "item_id_db": item_dict['item_id'],
+                    "oai_identifier": item_dict.get('oai_identifier'),
+                    "item_page_url": item_dict.get('item_page_url'),
+                    "title": metadata.get('title', 'N/A'),
+                    "authors": metadata.get('authors', []), # Asumiendo que authors es una lista en metadata_json
+                    "publication_date": metadata.get('publication_date'),
+                    "doi": metadata.get('doi'),
+                    "pdf_direct_url": metadata.get('pdf_direct_url'),
+                    "local_pdf_path": item_dict['local_path'],
+                    "md5_hash": item_dict['md5_hash'],
+                    "file_size_bytes": item_dict['file_size_bytes']
+                }
+                test_results.append(result_entry)
 
+                # Copiar el PDF a la carpeta de muestras para el DOC
+                if sample_dir and item_dict['local_path'] and os.path.exists(item_dict['local_path']):
+                    try:
+                        dest_filename = f"item_{item_dict['item_id']}_{os.path.basename(item_dict['local_path'])}"
+                        shutil.copy2(item_dict['local_path'], os.path.join(sample_dir, dest_filename))
+                        self.logger.info(f"PDF de muestra copiado a: {os.path.join(sample_dir, dest_filename)}")
+                    except Exception as e_copy:
+                        self.logger.error(f"Error al copiar PDF de muestra '{item_dict['local_path']}': {e_copy}")
+            
+            conn.close()
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(test_results, f, indent=4, ensure_ascii=False)
+            self.logger.info(f"Archivo de resultados de prueba JSON generado en: {output_file} con {len(test_results)} ítems.")
+
+        except sqlite3.Error as e:
+            self.logger.error(f"Error de base de datos al generar test_results.json: {e}")
+            if conn: conn.close()
         except Exception as e:
-            self.logger.error(f"Error generating test results JSON: {e}", exc_info=True)
-            if cursor: cursor.close()
+            self.logger.error(f"Error al generar test_results.json: {e}", exc_info=True)
+
+    def _run_keyword_search(self):
+        self.logger.info("Iniciando fase de búsqueda por palabra clave.")
+        keywords = self.config.get('keyword_search_keywords', [])
+        if not keywords:
+            self.logger.info("No hay palabras clave configuradas. Saltando fase de búsqueda por palabra clave.")
+            return
+
+        total_items_found_keyword = 0
+        try:
+            for keyword in keywords:
+                self.logger.info(f"Buscando palabra clave: '{keyword}'")
+                items_found_this_keyword = self.keyword_searcher.search_keyword(keyword)
+                total_items_found_keyword += items_found_this_keyword
+                self.logger.info(f"Se encontraron {items_found_this_keyword} ítems para la palabra clave '{keyword}'. Acumulado total: {total_items_found_keyword}")
+                if self.config.get('delay', 0.1) > 0: # Delay entre keywords
+                    time.sleep(self.config.get('delay', 0.1) * 5) # Un delay mayor entre keywords
+        except Exception as e:
+            self.logger.error(f"Error durante la búsqueda por palabra clave: {e}", exc_info=True)
+        finally:
+            self.keyword_searcher.quit_driver() # Asegurarse de cerrar el driver de Selenium
+        
+        self.logger.info(f"Fase de búsqueda por palabra clave completada. Total de ítems encontrados/procesados: {total_items_found_keyword}")
+        return {"keyword_search_total_items_processed": total_items_found_keyword} 
+
+    def _process_items_for_html_metadata(self):
+        """Procesa ítems que necesitan extracción de metadatos desde HTML."""
+        self.logger.info("Iniciando proceso de extracción de metadatos HTML...")
+        # Este estado es para ítems que vienen de Keyword Search y necesitan procesamiento de su página HTML
+        items_to_process = self.db_manager.get_items_to_process(statuses=['pending_html_processing'], limit=self.config.get('max_html_processing_items'))
+
+        if not items_to_process:
+            self.logger.info("No hay ítems pendientes de procesamiento HTML.")
+            return
+
+        self.logger.info(f"Se procesarán {len(items_to_process)} ítems para extracción de metadatos HTML.")
+        processed_count = 0
+        successful_extraction_count = 0
+
+        for item_data in items_to_process:
+            item_id = item_data['item_id']
+            item_page_url = item_data['item_page_url']
+            log_prefix = f"[ItemDB {item_id}]"
+
+            self.logger.info(f"{log_prefix} Procesando HTML para metadatos y enlace PDF: {item_page_url}")
+            self.db_manager.update_item_status(item_id, 'processing_html')
+
+            # La función extract_full_metadata_and_pdf_link ahora devuelve un dict de metadatos y el enlace PDF
+            # El HTML es obtenido dentro de la función del extractor si no se provee.
+            extracted_metadata, pdf_direct_url = self.html_extractor.extract_full_metadata_and_pdf_link(item_page_url, item_id_for_log=str(item_id))
+
+            if extracted_metadata or pdf_direct_url: # Si se extrajo algo
+                successful_extraction_count +=1
+                # Combinar con metadatos existentes si los hay (ej. título de la pág de búsqueda)
+                current_db_metadata = {}
+                item_details = self.db_manager.get_item_details(item_id)
+                if item_details and item_details.get('metadata_json'):
+                    try: current_db_metadata = json.loads(item_details['metadata_json'])
+                    except: pass
+                
+                # Priorizar metadatos recién extraídos de la página del ítem
+                current_db_metadata.update(extracted_metadata) 
+                if pdf_direct_url:
+                    current_db_metadata['pdf_direct_url'] = pdf_direct_url
+                
+                self.db_manager.log_item_metadata(item_id, current_db_metadata)
+                
+                if pdf_direct_url:
+                    self.logger.info(f"{log_prefix} Enlace PDF encontrado: {pdf_direct_url}. Ítem listo para descarga de PDF.")
+                    self.db_manager.update_item_status(item_id, 'awaiting_pdf_download')
+                else:
+                    self.logger.warning(f"{log_prefix} No se encontró enlace PDF directo, pero se extrajeron metadatos. Ítem necesita revisión o ya está completo sin PDF.")
+                    # Si no hay PDF, pero los metadatos son suficientes, se podría marcar como procesado sin PDF.
+                    # O podría tener otro estado como 'processed_no_pdf_found'
+                    self.db_manager.update_item_status(item_id, 'processed_metadata_only') # Nuevo estado sugerido
+            else:
+                self.logger.error(f"{log_prefix} Falló la extracción de metadatos y enlace PDF de {item_page_url}")
+                self.db_manager.update_item_status(item_id, 'error_html_processing')
+            
+            processed_count += 1
+            if self.config.get('delay', 0.1) > 0:
+                time.sleep(self.config.get('delay', 0.1))
+
+        self.logger.info(f"Proceso de extracción de metadatos HTML completado. Procesados: {processed_count}, Extracciones exitosas (parcial o total): {successful_extraction_count}")
 
     def run(self):
-        """Runs the full scraping process."""
-        self.logger.info(f"Starting Embrapa Scraper run at {datetime.now().isoformat()}")
-        start_time = time.time()
+        self.logger.info(f"Iniciando ejecución del Scraper para Embrapa (BR) a las {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        start_time = time.time() # Esta línea causaba el NameError si 'time' no estaba importado
 
-        # Phase 1: OAI Harvesting (if enabled)
-        self._run_oai_harvest()
+        # Fase 1: Cosecha OAI (si está habilitada)
+        oai_stats = self._run_oai_harvest()
+        if oai_stats:
+            self.logger.info(f"Resumen de cosecha OAI: {oai_stats}")
 
-        # Phase 2: Keyword Searching (if enabled)
-        self._run_keyword_search()
+        # Fase 2: Búsqueda por palabra clave (si está habilitada)
+        keyword_stats = self._run_keyword_search()
+        if keyword_stats:
+             self.logger.info(f"Resumen de búsqueda por palabra clave: {keyword_stats}")
 
-        # Phase 3: Process items for PDF links (from OAI or Keyword Search that need it)
-        self.logger.info("Starting phase: Process items for PDF links.")
-        self._process_items_for_pdf_links()
+        # Fase 3: Procesar ítems para extracción de metadatos HTML y/o enlaces PDF
+        # Esto es para ítems de keyword search (pending_html_processing) o ítems de OAI que no tenían pdf_direct_url (pending_download)
+        self._process_items_for_html_metadata() # Para ítems de keyword search
+        self._process_items_for_pdf_links(max_items_to_process=self.config.get('max_pdf_link_extraction_items')) # Para OAI items que no tenían el enlace directo
 
-        # Phase 4: Download actual PDFs for items ready for download
-        self.logger.info("Starting phase: Download pending PDFs.")
-        self._download_pending_pdfs()
+        # Fase 4: Descargar PDFs para ítems listos
+        self._download_pdf_files(max_items_to_process=self.config.get('max_pdf_download_items'))
 
-        # Phase 5: Generate summary/state files
-        self.logger.info("Starting phase: Generate report files.")
+        # Fase 5: Generar archivos de estado y resultados de prueba
         self._generate_state_json()
-        self._generate_test_results_json() # For VERIFY task
+        self._generate_test_results_json(max_sample_pdfs=self.config.get('test_results_sample_size', 5))
 
         end_time = time.time()
-        self.logger.info(f"Embrapa Scraper run finished in {end_time - start_time:.2f} seconds.")
-        
-        # Log final stats from DB
-        item_stats = self.db_manager.get_item_stats()
-        file_stats = self.db_manager.get_file_stats()
-        self.logger.info(f"Final Item Stats: {item_stats}")
-        self.logger.info(f"Final File Stats: {file_stats}")
+        self.logger.info(f"Ejecución del Scraper para Embrapa (BR) finalizada en {end_time - start_time:.2f} segundos.")
+        # Aquí puedes añadir un resumen final de la base de datos si es necesario.
+        final_item_stats = self.db_manager.get_item_stats()
+        final_file_stats = self.db_manager.get_file_stats()
+        self.logger.info(f"Estadísticas finales de ítems en BD: {final_item_stats}")
+        self.logger.info(f"Estadísticas finales de archivos en BD: {final_file_stats}")
 
-        # Close DB connection when done with all operations
         self.db_manager.close_connection()
-        self.logger.info("Database connection closed.")
+        self.logger.info("Conexión a la base de datos cerrada.")
 
 def main(args):
-    """Main execution function when script is called directly."""
-    config = DEFAULT_CONFIG_BR.copy() # Start with defaults
+    print(f"Argumentos recibidos por main: {args}") # Log de depuración
+    config = DEFAULT_CONFIG_BR.copy()
 
-    # --- Configuration loading and overriding --- 
-    # 1. Load from a YAML config file if specified (e.g., args.config_file)
-    # This part can be expanded. For now, using defaults.
-    # if args.config_file and os.path.exists(args.config_file):
-    #     try:
-    #         with open(args.config_file, 'r') as f:
-    #             yaml_config = yaml.safe_load(f)
-    #             config.update(yaml_config) # Override defaults with file config
-    #         print(f"Loaded configuration from {args.config_file}")
-    #     except Exception as e:
-    #         print(f"Error loading config file {args.config_file}: {e}. Using defaults.")
+    # Aquí podrías añadir lógica para cargar un archivo de configuración YAML si se proporciona
+    # y sobrescribir DEFAULT_CONFIG_BR, y luego sobrescribir con args específicos.
 
-    # 2. Override with command-line arguments (if any are defined and parsed)
-    # Example: if args.log_level: config['log_level'] = args.log_level
-    # Example: if args.keywords: config['keywords_to_search'] = args.keywords.split(',')
     if args.keyword:
-        config['keywords_to_search'] = [args.keyword]
-        config['keyword_searching_enabled'] = True
-        # Potentially disable OAI if only a specific keyword search is requested
-        # config['oai_harvesting_enabled'] = False 
-        print(f"Running keyword search for specific keyword: {args.keyword}")
+        config['keyword_search_keywords'] = [args.keyword]
+        print(f"Búsqueda por palabra clave establecida a: {args.keyword}")
     
-    if args.max_oai_records:
-        config['max_records_oai_per_repo'] = args.max_oai_records
-        print(f"Max OAI records per repo set to: {args.max_oai_records}")
-        
-    if args.max_keyword_items:
-        # This would require a new config key like 'max_total_keyword_items' or similar
-        # and KeywordSearcher would need to respect it globally, not just per keyword page.
-        # For now, we use 'max_search_pages_per_keyword' as the main control.
-        print(f"Note: --max-keyword-items is illustrative. Control via 'max_search_pages_per_keyword' in config.")
-
-    if args.source:
-        if args.source == 'oai':
-            config['keyword_searching_enabled'] = False
-            config['oai_harvesting_enabled'] = True
-            print("Running OAI harvesting only.")
-        elif args.source == 'keyword':
-            config['oai_harvesting_enabled'] = False
-            config['keyword_searching_enabled'] = True
-            print("Running keyword searching only.")
-            if not config['keywords_to_search'] and not args.keyword:
-                print("Warning: Keyword source selected but no keywords defined. Using defaults or provide --keyword.")
-                if not config['keywords_to_search']:
-                     config['keywords_to_search'] = ["agricultura"] # Default fallback if none set
+    if args.max_oai is not None: # Asegurarse de que el argumento no sea None
+        # Asumiendo que quieres aplicar este límite a ambos repositorios OAI si se especifica
+        config['max_oai_records_alice'] = args.max_oai
+        config['max_oai_records_infoteca'] = args.max_oai
+        print(f"Máximo de registros OAI por repositorio establecido a: {args.max_oai}")
 
     scraper = ScraperBR(config)
     scraper.run()
 
 if __name__ == '__main__':
-    # Setup command line argument parsing
-    parser = argparse.ArgumentParser(description="Scraper for Embrapa (Brazil) publications.")
-    parser.add_argument("--config", dest="config_file", help="Path to a YAML configuration file.")
-    parser.add_argument("--keyword", type=str, help="A specific keyword to search for. Overrides keywords in config.")
-    parser.add_argument("--max-oai-records", type=int, help="Maximum OAI records to fetch per repository.")
-    parser.add_argument("--max-keyword-items", type=int, help="Illustrative: Maximum total items to process from keyword search.")
-    parser.add_argument("--source", choices=['all', 'oai', 'keyword'], default='all', 
-                        help="Specify data source to process: 'oai', 'keyword', or 'all' (default)." )
-    # Add more arguments as needed (e.g., for log level, specific actions)
+    parser = argparse.ArgumentParser(description="Scraper para el portal de Embrapa (Brasil).")
+    parser.add_argument("-k", "--keyword", type=str, help="Palabra clave específica para buscar.")
+    parser.add_argument("--max-oai", type=int, help="Número máximo de registros a cosechar por cada repositorio OAI.")
+    # Añadir más argumentos según sea necesario (ej. --config-file, --log-level, etc.)
+
+    # Línea de depuración para ver qué argumentos se están parseando
+    # import sys
+    # print(f"Argumentos de línea de comando raw: {sys.argv}")
 
     args = parser.parse_args()
+    
+    # Línea de depuración para ver los argumentos parseados
+    # print(f"Argumentos parseados: {args}")
+
     main(args)
