@@ -198,409 +198,327 @@ class DatabaseManagerBR:
         now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
 
         if metadata_dict:
-            metadata_json_str = json.dumps(metadata_dict, ensure_ascii=False)
-            updates.append("metadata_json = ?")
-            params.append(metadata_json_str)
-
+            try:
+                metadata_json_str = json.dumps(metadata_dict, ensure_ascii=False)
+                updates.append("metadata_json = ?")
+                params.append(metadata_json_str)
+            except TypeError as te:
+                self.logger.error(f"Error serializando metadatos a JSON para item ID {item_id}: {te}")
+                # No añadir metadata_json si falla la serialización
+        
         if html_path:
             updates.append("html_local_path = ?")
             params.append(html_path)
         
         if not updates: # No hay nada que actualizar
-            self.logger.debug(f"No hay metadatos ni ruta HTML para loguear para el ítem ID {item_id}")
+            self.logger.debug(f"log_item_metadata llamado para item ID {item_id} pero sin metadatos ni html_path para actualizar.")
             return False
 
         updates.append("last_processed_timestamp = ?")
         params.append(now)
-        params.append(item_id) # Para la cláusula WHERE
+        params.append(item_id) # Para el WHERE clause
 
-        sql = f"UPDATE items SET { ', '.join(updates) } WHERE item_id = ?"
-        
         conn = self._connect()
         cursor = conn.cursor()
-        updated_row = False
+        updated_meta = False
         try:
+            sql = f"UPDATE items SET { ', '.join(updates) } WHERE item_id = ?"
             cursor.execute(sql, tuple(params))
             conn.commit()
             if cursor.rowcount > 0:
-                self.logger.info(f"Metadatos y/o HTML path logueados para ítem ID {item_id}.")
-                updated_row = True
+                self.logger.info(f"Metadatos y/o HTML path para ítem ID {item_id} actualizados/guardados.")
+                updated_meta = True
             else:
-                self.logger.warning(f"No se encontró el ítem ID {item_id} para loguear metadatos/HTML path.")
+                self.logger.warning(f"No se encontró el ítem ID {item_id} para actualizar metadatos/HTML path.")
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite logueando metadatos/HTML path para ítem ID {item_id}: {e}")
+            self.logger.error(f"Error SQLite actualizando metadatos/HTML path para ítem ID {item_id}: {e}")
             if conn: conn.rollback()
         finally:
             if conn: conn.close()
-        return updated_row
+        return updated_meta
 
     def get_item_details(self, item_id):
-        """Obtiene todos los detalles de un ítem específico de la tabla items."""
-        if item_id is None:
-            self.logger.error("get_item_details llamado con item_id None.")
-            return None
+        """Obtiene todos los detalles de un ítem por su ID."""
         conn = self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("SELECT * FROM items WHERE item_id = ?", (item_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                return dict(row)
+            else:
+                self.logger.warning(f"No se encontró ítem con ID {item_id}")
+                return None
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite obteniendo detalles para ítem ID {item_id}: {e}")
+            self.logger.error(f"Error SQLite obteniendo detalles del ítem ID {item_id}: {e}")
             return None
         finally:
             if conn: conn.close()
 
     def get_items_to_process(self, statuses=None, discovery_modes=None, limit=None):
-        """Obtiene ítems basados en su estado de procesamiento y/o modo de descubrimiento.
-           Devuelve una lista de diccionarios, cada uno representando un ítem.
-        """
+        """Obtiene ítems que necesitan procesamiento, opcionalmente filtrados por estado(s) y modo(s) de descubrimiento."""
         conn = self._connect()
         cursor = conn.cursor()
         items = []
+        
+        base_sql = "SELECT item_id, item_page_url, oai_identifier, repository_source, discovery_mode, metadata_json, processing_status FROM items"
+        conditions = []
+        params = []
+
+        if statuses:
+            if isinstance(statuses, str):
+                statuses = [statuses]
+            placeholders = ', '.join('?' * len(statuses))
+            conditions.append(f"processing_status IN ({placeholders})")
+            params.extend(statuses)
+        
+        if discovery_modes:
+            if isinstance(discovery_modes, str):
+                discovery_modes = [discovery_modes]
+            placeholders = ', '.join('?' * len(discovery_modes))
+            conditions.append(f"discovery_mode IN ({placeholders})")
+            params.extend(discovery_modes)
+
+        if conditions:
+            base_sql += " WHERE " + " AND ".join(conditions)
+        
+        base_sql += " ORDER BY last_processed_timestamp ASC, created_timestamp ASC" # Priorizar más antiguos / menos procesados
+
+        if limit is not None and isinstance(limit, int) and limit > 0:
+            base_sql += " LIMIT ?"
+            params.append(limit)
+
         try:
-            base_sql = "SELECT * FROM items"
-            conditions = []
-            params = []
-
-            if statuses and isinstance(statuses, list):
-                # Crear placeholders para la cláusula IN
-                status_placeholders = ', '.join('?' for _ in statuses)
-                conditions.append(f"processing_status IN ({status_placeholders})")
-                params.extend(statuses)
-            elif statuses and isinstance(statuses, str):
-                conditions.append("processing_status = ?")
-                params.append(statuses)
-            
-            if discovery_modes and isinstance(discovery_modes, list):
-                discovery_placeholders = ', '.join('?' for _ in discovery_modes)
-                conditions.append(f"discovery_mode IN ({discovery_placeholders})")
-                params.extend(discovery_modes)
-            elif discovery_modes and isinstance(discovery_modes, str):
-                conditions.append("discovery_mode = ?")
-                params.append(discovery_modes)
-
-            if conditions:
-                base_sql += " WHERE " + " AND ".join(conditions)
-            
-            base_sql += " ORDER BY last_processed_timestamp ASC, created_timestamp ASC" # Priorizar más antiguos o menos procesados
-
-            if limit is not None and isinstance(limit, int) and limit > 0:
-                base_sql += " LIMIT ?"
-                params.append(limit)
-            
             cursor.execute(base_sql, tuple(params))
-            rows = cursor.fetchall()
-            for row in rows:
-                items.append(dict(row))
-            
-            self.logger.info(f"Encontrados {len(items)} ítems para procesar. Estados: {statuses}, Modos: {discovery_modes}, Límite: {limit}")
+            for row in cursor.fetchall():
+                item_dict = dict(row)
+                # Parsear metadata_json si existe
+                # if item_dict.get('metadata_json'):
+                #     try:
+                #         item_dict['metadata_json'] = json.loads(item_dict['metadata_json'])
+                #     except json.JSONDecodeError:
+                #         self.logger.warning(f"Error decodificando metadata_json para item_id {item_dict['item_id']}. Se devolverá como string.")
+                items.append(item_dict)
+            self.logger.info(f"Se encontraron {len(items)} ítems para procesar. Filtros: statuses={statuses}, modes={discovery_modes}, limit={limit}")
             return items
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite obteniendo ítems para procesar: {e}")
+            self.logger.error(f"Error SQLite obteniendo ítems para procesar: {e}. SQL: {base_sql}, Params: {params}")
             return []
         finally:
             if conn: conn.close()
 
     # --- Métodos para Files ---
     def log_file_attempt(self, item_id, file_type, remote_url):
-        """Registra un intento de descarga de archivo. Crea la entrada si no existe."""
-        if item_id is None or not remote_url:
-            self.logger.error("log_file_attempt llamado con item_id o remote_url None.")
-            return None # O False
-
+        """Registra un intento de descarga de archivo. Crea o actualiza la entrada del archivo."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
         conn = self._connect()
         cursor = conn.cursor()
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-        file_id = None
         try:
-            # Verificar si ya existe este archivo para este ítem
             cursor.execute("SELECT file_id FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
             row = cursor.fetchone()
-            if row:
-                file_id = row['file_id']
-                # Actualizar solo el timestamp del último intento
-                cursor.execute("UPDATE files SET last_attempt_timestamp = ? WHERE file_id = ?", (now, file_id))
-                self.logger.debug(f"Actualizado timestamp de intento para archivo existente ID {file_id}, URL: {remote_url}")
-            else:
-                # Crear nueva entrada de archivo
-                sql_insert = """INSERT INTO files 
-                                  (item_id, file_type, remote_url, download_status, last_attempt_timestamp, download_timestamp)
-                                  VALUES (?, ?, ?, 'pending', ?, NULL)""" # download_timestamp es NULL hasta descarga exitosa
-                cursor.execute(sql_insert, (item_id, file_type, remote_url, now))
-                file_id = cursor.lastrowid
-                self.logger.info(f"Nueva entrada de archivo creada ID {file_id} para ítem {item_id}, URL: {remote_url}")
+            if row: # Actualizar intento
+                # cursor.execute("UPDATE files SET last_attempt_timestamp = ? WHERE file_id = ?", (now, row['file_id']))
+                # La lógica de actualizar el intento está implícita en log_file_result, no es necesario aquí.
+                pass
+            else: # Crear nueva entrada de archivo
+                cursor.execute("""INSERT INTO files (item_id, file_type, remote_url, download_status, last_attempt_timestamp)
+                                  VALUES (?, ?, ?, ?, ?)""", 
+                               (item_id, file_type, remote_url, 'pending', now))
             conn.commit()
+            # self.logger.debug(f"Intento de descarga para item {item_id}, URL {remote_url} registrado/actualizado.")
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite en log_file_attempt para ítem {item_id}, URL {remote_url}: {e}")
+            self.logger.error(f"Error SQLite registrando intento de descarga para item {item_id}, URL {remote_url}: {e}")
             if conn: conn.rollback()
-            file_id = None # Asegurar que no se devuelva un file_id inválido
         finally:
             if conn: conn.close()
-        return file_id
 
     def log_file_result(self, item_id, file_type, remote_url, download_status, 
                           local_path=None, md5_hash=None, file_size_bytes=None):
-        """Registra el resultado de una descarga de archivo. 
-           Crea la entrada si no existe, o la actualiza si existe.
-        """
-        if item_id is None or not remote_url:
-            self.logger.error("log_file_result llamado con item_id o remote_url None.")
-            return False
-        
+        """Registra el resultado de una descarga de archivo (éxito o fallo)."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
         conn = self._connect()
         cursor = conn.cursor()
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-        updated_rows = 0
+        logged = False
         try:
-            # Buscar si el archivo ya existe
+            # Verificar si el archivo ya existe para este item_id y remote_url
             cursor.execute("SELECT file_id FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
             row = cursor.fetchone()
-            file_id = row['file_id'] if row else None
 
-            if file_id: # Actualizar existente
-                sql_update = """UPDATE files SET 
-                                   file_type = COALESCE(?, file_type), 
-                                   local_path = ?, 
-                                   download_status = ?, 
-                                   md5_hash = ?, 
-                                   file_size_bytes = ?, 
-                                   last_attempt_timestamp = ?, 
-                                   download_timestamp = CASE WHEN ? = 'downloaded' THEN ? ELSE download_timestamp END
-                               WHERE file_id = ?"""
-                params_update = (file_type, local_path, download_status, md5_hash, file_size_bytes, now, 
-                                 download_status, now, # Para actualizar download_timestamp solo si es 'downloaded'
-                                 file_id)
-                cursor.execute(sql_update, params_update)
-                updated_rows = cursor.rowcount
-                if updated_rows > 0:
-                    self.logger.info(f"Resultado de archivo ID {file_id} actualizado. Estado: {download_status}, Path: {local_path}")
-                else:
-                    self.logger.warning(f"No se actualizó el archivo ID {file_id} (quizás no hubo cambios o no se encontró). URL: {remote_url}")
-            else: # Crear nuevo
-                sql_insert = """INSERT INTO files 
-                                  (item_id, file_type, remote_url, local_path, download_status, 
-                                   md5_hash, file_size_bytes, last_attempt_timestamp, download_timestamp)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-                download_ts_val = now if download_status == 'downloaded' else None
-                params_insert = (item_id, file_type, remote_url, local_path, download_status, 
-                                 md5_hash, file_size_bytes, now, download_ts_val)
-                cursor.execute(sql_insert, params_insert)
-                new_file_id = cursor.lastrowid
-                updated_rows = 1 # Se insertó una fila
-                self.logger.info(f"Nuevo resultado de archivo ID {new_file_id} registrado. Ítem: {item_id}, URL: {remote_url}, Estado: {download_status}")
+            if row: # Actualizar el registro existente
+                file_id = row['file_id']
+                updates = []
+                params_update = []
+                if local_path is not None: updates.append("local_path = ?"); params_update.append(local_path)
+                if md5_hash is not None: updates.append("md5_hash = ?"); params_update.append(md5_hash)
+                if file_size_bytes is not None: updates.append("file_size_bytes = ?"); params_update.append(file_size_bytes)
+                updates.append("download_status = ?"); params_update.append(download_status)
+                updates.append("last_attempt_timestamp = ?"); params_update.append(now)
+                if download_status == 'downloaded':
+                     updates.append("download_timestamp = ?"); params_update.append(now)
+                
+                params_update.append(file_id) # Para el WHERE
+                
+                sql_update = f"UPDATE files SET { ', '.join(updates) } WHERE file_id = ?"
+                cursor.execute(sql_update, tuple(params_update))
+                self.logger.info(f"Resultado de descarga para archivo existente ID {file_id} (Item {item_id}, URL {remote_url}) actualizado a: {download_status}")
+            else: # Crear un nuevo registro de archivo
+                dt = now if download_status == 'downloaded' else None # Download timestamp solo si fue exitoso
+                cursor.execute("""INSERT INTO files 
+                                  (item_id, file_type, remote_url, local_path, download_status, md5_hash, file_size_bytes, download_timestamp, last_attempt_timestamp)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                               (item_id, file_type, remote_url, local_path, download_status, md5_hash, file_size_bytes, dt, now))
+                self.logger.info(f"Nuevo archivo registrado para item {item_id} (URL {remote_url}). Estado: {download_status}, Path: {local_path}")
             
             conn.commit()
+            logged = True
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite en log_file_result para ítem {item_id}, URL {remote_url}: {e}")
+            self.logger.error(f"Error SQLite registrando resultado de descarga para item {item_id}, URL {remote_url}: {e}")
             if conn: conn.rollback()
-            updated_rows = 0 # Indicar fallo
         finally:
             if conn: conn.close()
-        return updated_rows > 0
+        return logged
 
     def get_file_status(self, item_id, remote_url):
-        """Obtiene el estado de descarga y la ruta local de un archivo específico."""
-        if item_id is None or not remote_url:
-            self.logger.warning("get_file_status llamado con item_id o remote_url None.")
-            return None, None
+        """Obtiene el download_status y local_path de un archivo por item_id y remote_url."""
         conn = self._connect()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT download_status, local_path FROM files WHERE item_id = ? AND remote_url = ?", 
-                           (item_id, remote_url))
+            cursor.execute("SELECT download_status, local_path FROM files WHERE item_id = ? AND remote_url = ?", (item_id, remote_url))
             row = cursor.fetchone()
             if row:
                 return row['download_status'], row['local_path']
-            else:
-                return None, None # No encontrado
+            return None, None # No encontrado
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite obteniendo estado de archivo para ítem {item_id}, URL {remote_url}: {e}")
+            self.logger.error(f"Error SQLite obteniendo estado de archivo para item {item_id}, URL {remote_url}: {e}")
             return None, None
         finally:
             if conn: conn.close()
 
     def get_downloaded_files_for_item(self, item_id, file_type='pdf'):
-        """Obtiene una lista de archivos descargados (con su ruta local) para un ítem y tipo de archivo."""
-        if item_id is None:
-            self.logger.warning("get_downloaded_files_for_item llamado con item_id None.")
-            return []
+        """Obtiene una lista de archivos descargados (con su ruta local) para un ítem específico y tipo de archivo."""
         conn = self._connect()
         cursor = conn.cursor()
         files = []
         try:
-            cursor.execute("SELECT local_path, remote_url, md5_hash, file_size_bytes FROM files "
-                           "WHERE item_id = ? AND file_type = ? AND download_status IN ('downloaded', 'skipped_exists')", 
+            cursor.execute("SELECT local_path, remote_url, md5_hash, file_size_bytes FROM files WHERE item_id = ? AND file_type = ? AND download_status IN ('downloaded', 'skipped_exists')", 
                            (item_id, file_type))
-            rows = cursor.fetchall()
-            for row in rows:
+            for row in cursor.fetchall():
                 files.append(dict(row))
             return files
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite obteniendo archivos descargados para ítem {item_id}, tipo {file_type}: {e}")
+            self.logger.error(f"Error SQLite obteniendo archivos descargados para ítem {item_id}: {e}")
             return []
         finally:
             if conn: conn.close()
 
     def get_all_items_for_report(self):
-        """Obtiene todos los ítems con sus metadatos y archivos asociados para un reporte.
-           Devuelve una lista de diccionarios, uno por ítem.
-        """
+        """Prepara datos para reportes como state.json. Devuelve una lista de dicts con info de ítems y sus PDFs."""
         conn = self._connect()
         cursor = conn.cursor()
-        items_report = []
+        items_report_data = []
         try:
             # Obtener todos los ítems primero
-            cursor.execute("SELECT * FROM items ORDER BY item_id")
-            item_rows = cursor.fetchall()
+            cursor.execute("SELECT item_id, item_page_url, oai_identifier, repository_source, processing_status, metadata_json, html_local_path FROM items ORDER BY item_id")
+            all_items_rows = cursor.fetchall()
 
-            for item_row_raw in item_rows:
-                item_dict = dict(item_row_raw)
-                item_id = item_dict['item_id']
+            for item_row_raw in all_items_rows:
+                item_data = dict(item_row_raw)
+                item_id = item_data['item_id']
                 
                 # Parsear metadata_json si existe
-                if item_dict.get('metadata_json'):
+                if item_data.get('metadata_json'):
                     try:
-                        item_dict['metadata_json'] = json.loads(item_dict['metadata_json'])
+                        item_data['metadata_json'] = json.loads(item_data['metadata_json'])
                     except json.JSONDecodeError:
-                        self.logger.warning(f"No se pudo parsear metadata_json para item ID {item_id}. Se devolverá como string.")
+                        self.logger.warning(f"Error decodificando metadata_json para item_id {item_id} en get_all_items_for_report. Se dejará como string.")
                 else:
-                    item_dict['metadata_json'] = {} # Default a dict vacío
+                    item_data['metadata_json'] = {} # Asegurar que sea un dict si es None
 
-                # Obtener archivos asociados al ítem
-                cursor.execute("SELECT * FROM files WHERE item_id = ? ORDER BY file_id", (item_id,))
-                file_rows = cursor.fetchall()
-                item_dict['pdfs'] = [dict(f_row) for f_row in file_rows if f_row['file_type'] == 'pdf']
-                item_dict['other_files'] = [dict(f_row) for f_row in file_rows if f_row['file_type'] != 'pdf']
+                # Obtener archivos PDF para este ítem
+                cursor.execute("SELECT remote_url, local_path, download_status FROM files WHERE item_id = ? AND file_type = 'pdf'", (item_id,))
+                pdf_files_for_item = [dict(pdf_row) for pdf_row in cursor.fetchall()]
+                item_data['pdfs'] = pdf_files_for_item
                 
-                items_report.append(item_dict)
-            
-            self.logger.info(f"Reporte generado para {len(items_report)} ítems.")
-            return items_report
+                items_report_data.append(item_data)
+                
+            self.logger.info(f"Se prepararon datos de reporte para {len(items_report_data)} ítems.")
+            return items_report_data
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite generando reporte de todos los ítems: {e}")
+            self.logger.error(f"Error SQLite preparando datos de reporte para todos los ítems: {e}")
             return []
         finally:
             if conn: conn.close()
-            
+
     def get_sample_downloaded_pdfs_for_report(self, max_results=5):
-        """Obtiene una muestra de PDFs que han sido descargados exitosamente, 
-           junto con los metadatos del ítem al que pertenecen.
-           Útil para generar test_results.json y copiar muestras.
-        """
+        """Obtiene una muestra de PDFs descargados con sus metadatos de ítem para el test_results.json."""
         conn = self._connect()
         cursor = conn.cursor()
-        sample_data = []
+        pdf_report_data = []
         try:
-            # Seleccionar PDFs descargados y unir con la tabla de ítems para obtener metadatos
+            # Seleccionar archivos PDF descargados y unir con la tabla de ítems para obtener metadatos del ítem
+            # Usamos una subconsulta para seleccionar file_ids aleatorios o los primeros N para la muestra.
+            # SQLite puede ser peculiar con RAND(), así que LIMIT puede ser más predecible.
             sql = """
             SELECT 
-                i.item_id, i.item_page_url, i.oai_identifier, i.metadata_json,
-                f.file_id, f.remote_url, f.local_path, f.md5_hash, f.file_size_bytes
+                f.remote_url, f.local_path, f.md5_hash, f.file_size_bytes,
+                i.item_id, i.item_page_url, i.metadata_json 
             FROM files f
             JOIN items i ON f.item_id = i.item_id
             WHERE f.file_type = 'pdf' AND f.download_status IN ('downloaded', 'skipped_exists')
-            ORDER BY RANDOM() -- Para obtener una muestra aleatoria
+            ORDER BY f.file_id -- Opcional: o RANDOM()
             LIMIT ?
             """
             cursor.execute(sql, (max_results,))
-            rows = cursor.fetchall()
-            for row_raw in rows:
-                row_dict = dict(row_raw)
-                # Parsear metadata_json
-                if row_dict.get('metadata_json'):
+            for row_raw in cursor.fetchall():
+                pdf_entry = dict(row_raw)
+                # Parsear metadata_json del ítem asociado
+                if pdf_entry.get('metadata_json'):
                     try:
-                        row_dict['metadata_json'] = json.loads(row_dict['metadata_json'])
+                        pdf_entry['metadata_json'] = json.loads(pdf_entry['metadata_json'])
                     except json.JSONDecodeError:
-                        self.logger.warning(f"No se pudo parsear metadata_json para item ID {row_dict['item_id']} en muestra de PDFs. Se usará dict vacío.")
-                        row_dict['metadata_json'] = {}
+                        self.logger.warning(f"Error decodificando metadata_json del ítem {pdf_entry['item_id']} para el reporte de PDF muestreado. Se dejará como string.")
                 else:
-                    row_dict['metadata_json'] = {}
-                sample_data.append(row_dict)
+                    pdf_entry['metadata_json'] = {} # Asegurar dict si es None
+                pdf_report_data.append(pdf_entry)
             
-            self.logger.info(f"Muestra de {len(sample_data)} PDFs descargados obtenida para reporte.")
-            return sample_data
+            self.logger.info(f"Se obtuvo una muestra de {len(pdf_report_data)} PDFs descargados para reporte.")
+            return pdf_report_data
         except sqlite3.Error as e:
             self.logger.error(f"Error SQLite obteniendo muestra de PDFs descargados: {e}")
             return []
         finally:
             if conn: conn.close()
 
+    # --- Funciones de utilidad / chequeo (ejemplos, pueden no ser todas necesarias) ---
     def check_item_exists(self, oai_identifier):
-        """Verifica si un ítem con un identificador OAI específico ya existe."""
+        """Verifica si un ítem existe basado en su identificador OAI."""
         conn = self._connect()
         cursor = conn.cursor()
         try:
             cursor.execute("SELECT item_id FROM items WHERE oai_identifier = ?", (oai_identifier,))
             return cursor.fetchone() is not None
         except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite verificando si existe ítem OAI {oai_identifier}: {e}")
-            return False # Asumir que no existe en caso de error
+            self.logger.error(f"Error verificando existencia del ítem OAI {oai_identifier}: {e}")
+            return False # Asumir que no existe si hay error
         finally:
             if conn: conn.close()
 
+    # Este es un método de conveniencia que combina get_or_create e update_status
+    # Puede ser útil en OAIHarvester
     def register_item(self, item_page_url, repository_source=None, oai_identifier=None, discovery_mode=None, search_keyword=None, initial_status='pending_metadata'):
-        """Función de conveniencia para simplificar el registro de un nuevo ítem si no existe."""
-        # Esta función es esencialmente un alias más simple para get_or_create_item si solo se quiere registrar
-        # y no necesariamente preocuparse por si fue creado o ya existía, solo obtener su ID.
-        item_id, _ = self.get_or_create_item(
-            item_page_url=item_page_url,
-            repository_source=repository_source,
+        """Simplifica el registro o actualización de un ítem, devolviendo su ID y si fue recién creado."""
+        item_id, current_status = self.get_or_create_item(
+            item_page_url=item_page_url, 
+            repository_source=repository_source, 
             oai_identifier=oai_identifier,
             discovery_mode=discovery_mode,
             search_keyword=search_keyword,
             initial_status=initial_status
         )
-        return item_id
-    
-    def update_item_metadata_if_newer(self, item_id, new_metadata_dict, source_timestamp_str=None):
-        """Actualiza los metadatos de un ítem solo si los nuevos datos son más recientes
-           o si no hay metadatos previos. Usa 'last_processed_timestamp' del ítem para comparar.
-        """
-        # Esta función necesitaría una lógica más robusta para comparar timestamps
-        # y decidir si actualizar. Por ahora, es un placeholder conceptual.
-        # Si source_timestamp_str es provisto (ej. de OAI datestamp), se podría usar eso.
-        # O, simplemente, si los metadatos nuevos son diferentes, se actualizan.
-        
-        # Simplificación: por ahora, simplemente llama a log_item_metadata que sobrescribe.
-        # Una implementación real compararía timestamps o el contenido del JSON.
-        self.logger.debug(f"Actualización condicional de metadatos (actualmente simple) para item ID {item_id}")
-        return self.log_item_metadata(item_id, new_metadata_dict)
+        created = (current_status == initial_status) # Asumimos que si el estado es el inicial, fue creado ahora
+                                                 # Esto es una simplificación, get_or_create_item podría ser más preciso
+        return item_id, created
 
-    def count_items_by_status(self, status):
-        """Cuenta cuántos ítems tienen un estado de procesamiento específico."""
-        conn = self._connect()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT COUNT(item_id) FROM items WHERE processing_status = ?", (status,))
-            count = cursor.fetchone()[0]
-            return count
-        except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite contando ítems por estado {status}: {e}")
-            return 0
-        finally:
-            if conn: conn.close()
-            
-    def delete_item_and_associated_data(self, item_id):
-        """Elimina un ítem y todos sus datos asociados (metadatos, archivos) de la BD."""
-        # Esta es una operación destructiva. Usar con cuidado.
-        # ON DELETE CASCADE debería manejar la eliminación de registros en files y metadata.
-        conn = self._connect()
-        cursor = conn.cursor()
-        updated_rows = None # Para rastrear si la eliminación fue exitosa
-        try:
-            # Opcional: primero eliminar archivos físicos asociados si es necesario.
-            # Esta función solo se encarga de los registros de la BD.
-            cursor.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
-            conn.commit()
-            updated_rows = cursor.rowcount
-            if updated_rows > 0:
-                self.logger.info(f"Ítem ID {item_id} y sus datos asociados eliminados de la base de datos.")
-            else:
-                self.logger.warning(f"No se encontró el ítem ID {item_id} para eliminar.")
-        except sqlite3.Error as e:
-            self.logger.error(f"Error SQLite eliminando ítem ID {item_id}: {e}")
-            if conn: conn.rollback()
-        finally:
-            if conn: conn.close()
-        return updated_rows > 0 if updated_rows is not None else False
+# No incluir el bloque if __name__ == '__main__' aquí, ya que este archivo es un módulo
+# Las pruebas unitarias deben estar en un archivo de prueba separado (ej. test_database_manager_br.py)
+# o ejecutarse condicionalmente si este archivo se ejecuta como script principal (pero es menos ideal para módulos).
