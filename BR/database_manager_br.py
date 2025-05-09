@@ -25,6 +25,8 @@ class DatabaseManagerBR:
 
     def _ensure_db_directory(self):
         db_dir = os.path.dirname(self.db_file)
+        # Añadir log para ver la ruta absoluta
+        self.logger.info(f"Ruta absoluta del archivo de BD configurado: {os.path.abspath(self.db_file)}")
         if db_dir and not os.path.exists(db_dir):
             try:
                 os.makedirs(db_dir, exist_ok=True)
@@ -587,4 +589,4 @@ if __name__ == '__main__':
     test_logger.info("Funciones de reporte ejecutadas.")
 
     test_logger.info("Pruebas de DatabaseManagerBR finalizadas.")
-    # os.remove(test_db_file) # Comentar para inspeccionar la BD de prueba
+    # os.remove(test_db_file) # Comentar para inspeccionar la BD de prueba 
