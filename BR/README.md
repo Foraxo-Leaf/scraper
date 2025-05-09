@@ -1,4 +1,3 @@
-
 # Scraper para Embrapa (Brasil)
 
 Este scraper está diseñado para recolectar información sobre publicaciones del portal de Embrapa, la Empresa Brasileña de Investigación Agropecuaria.
