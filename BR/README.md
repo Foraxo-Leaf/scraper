@@ -88,11 +88,14 @@ BR/
 El scraper se configura principalmente a través del diccionario `DEFAULT_CONFIG_BR` en el archivo `BR/scraper.py`. Algunas configuraciones clave incluyen:
 
 *   **Límites de Cosecha OAI:**
-    *   `max_oai_records_alice`: Número máximo de registros a cosechar de Alice (ej. `20`). Poner en `None` para ilimitado.
-    *   `max_oai_records_infoteca`: Número máximo de registros a cosechar de Infoteca-e (ej. `20`). Poner en `None` para ilimitado.
+    *   `max_oai_records_alice`: Número máximo de registros a cosechar de Alice (ej. `2`). Poner en `None` para ilimitado.
+    *   `max_oai_records_infoteca-e`: Número máximo de registros a cosechar de Infoteca-e (ej. `2`). Poner en `None` para ilimitado.
 *   **Búsqueda por Palabras Clave:**
     *   `keyword_search_keywords`: Lista de palabras clave a buscar (ej. `["maiz", "soja"]`). Dejar vacío `[]` para omitir.
     *   `keyword_max_pages`: Número máximo de páginas de resultados a procesar por palabra clave.
+*   **Control de Flujo (NUEVO):**
+    *   `run_oai_harvest` (Boolean `True`/`False`): Permite habilitar o deshabilitar completamente la fase de cosecha OAI-PMH. Por defecto es `True`.
+    *   `run_keyword_search` (Boolean `True`/`False`): Permite habilitar o deshabilitar completamente la fase de búsqueda por palabras clave. Por defecto es `True`.
 *   **Límites de Procesamiento de Ítems:**
     *   `max_html_processing_items`: Máximo de ítems a procesar para extracción de metadatos HTML por ejecución.
     *   `max_pdf_link_extraction_items`: Máximo de ítems a procesar para extracción de enlaces PDF por ejecución.
@@ -111,7 +114,12 @@ Los selectores XPath para la extracción de metadatos de páginas HTML (usados p
     ```bash
     python3 -m BR.scraper
     ```
-3.  **Para una prueba limpia, especialmente después de cambios significativos o para probar la cosecha OAI desde cero, se recomienda borrar la base de datos:**
+3.  **Para probar modos específicos (OAI o búsqueda por palabra clave):**
+    *   Modifica los flags `run_oai_harvest` y `run_keyword_search` en el diccionario `DEFAULT_CONFIG_BR` dentro de `BR/scraper.py`.
+        *   **Solo OAI:** `run_oai_harvest: True`, `run_keyword_search: False`
+        *   **Solo Keyword Search:** `run_oai_harvest: False`, `run_keyword_search: True`
+        *   **Ambos:** `run_oai_harvest: True`, `run_keyword_search: True`
+4.  **Para una prueba limpia, especialmente después de cambios significativos o para probar la cosecha OAI desde cero, se recomienda borrar la base de datos:**
     ```bash
     # rm BR/db/scraper_br.db  # (Opcional, pero recomendado para pruebas limpias)
     # python3 -m BR.scraper
@@ -211,3 +219,4 @@ El scraper registrará su progreso en la consola y en el archivo `BR/logs/BR-SCR
     ```
 
 Este README debería proporcionar una buena base. 
+
