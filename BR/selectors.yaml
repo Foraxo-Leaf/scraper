@@ -1,79 +1,72 @@
-# Selectors for DSpace repositories (like Alice and Infoteca-e from Embrapa)
-# These are general placeholders and might need specific adjustments per repository instance.
+# BR/selectors.yaml
 
-# Selectors for extracting PDF links from an item's page
-pdf_link_selectors:
-  # Tries to find a direct link to a PDF within standard DSpace metadata fields or common link texts
-  - path: "//a[contains(@href, '.pdf') and (contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'pdf') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'texto completo') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'full text'))]/@href"
-  - path: "//meta[@name='citation_pdf_url']/@content" # Standard highwire press tag for PDF URL
-  - path: "//meta[@name='DC.Identifier' and contains(@content, '.pdf')]/@content" # Dublin Core identifier if it's a PDF link
-  - path: "//div[contains(@class, 'file-link')]/a[contains(@href, '.pdf')]/@href" # Common class for file links
+# Selectores para la página de ítem de DSpace (Alice / Infoteca-e)
+dspace_item_page:
+  # Selectores para encontrar el enlace relativo al PDF principal.
+  # Se prueban en orden.
+  pdf_link_xpaths: # Cambiado de pdf_link_relative a una lista
+    # Nuevo selector específico para cabecera "Fichero"
+    - "//table[.//tr/th[1][normalize-space(text())='Fichero'] or .//tr/td[1][normalize-space(text())='Fichero']]//tr[td[a[contains(@href, '/bitstream/')]]]/td[1]//a[contains(@href,'.pdf')]/@href"
+    # Selector original (fallback por si "FICHERO" aparece en algún lado o para otros DSpace)
+    - "//table[.//th[contains(translate(., 'FICHERO', 'fichero'), 'fichero')]]//td/a[contains(@href, '/bitstream/') and substring(@href, string-length(@href) - string-length('.pdf') + 1) = '.pdf']/@href"
+    # Fallback muy genérico: cualquier enlace a un bitstream PDF en la página
+    - "//a[contains(@href, '/bitstream/') and contains(@href, '.pdf')]/@href"
 
-# Selectors for extracting individual metadata fields from an item's page
-# These primarily target Dublin Core metadata tags, common in DSpace.
-metadata_selectors:
-  title:
-    - path: "//meta[@name='DC.title']/@content"
-    - path: "//meta[@name='citation_title']/@content"
-    - path: "//h1[contains(@class, 'page-header') or contains(@class, 'ds-artifact-title')]/text()"
-  author:
-    # Extracts multiple authors if present
-    - path: "//meta[@name='DC.creator']/@content"
-    - path: "//meta[@name='citation_author']/@content"
-    - path: "//div[contains(@class, 'ds-dc_contributor_author-value') or contains(@class, 'author-value')]/a/text()"
-  publication_date: # Tries to get the issue date
-    - path: "//meta[@name='DCTERMS.issued']/@content"
-    - path: "//meta[@name='DC.date.issued']/@content"
-    - path: "//meta[@name='citation_date']/@content"
-    - path: "//div[contains(@class, 'ds-dc_date_issued-value') or contains(@class, 'date-value')]/text()"
-  abstract:
-    - path: "//meta[@name='DCTERMS.abstract']/@content"
-    - path: "//meta[@name='DC.description.abstract']/@content"
-    - path: "//div[contains(@class, 'ds-dc_description_abstract-value') or contains(@class, 'abstract-value')]/p/text()"
-  keywords:
-    # Extracts multiple keywords if present
-    - path: "//meta[@name='DC.subject']/@content"
-    - path: "//meta[@name='citation_keywords']/@content"
-    - path: "//div[contains(@class, 'ds-dc_subject-value') or contains(@class, 'keywords-value')]/a/text()"
-  doi:
-    - path: "//meta[@name='DC.identifier.doi']/@content"
-    - path: "//meta[@name='citation_doi']/@content"
-    - path: "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/text()"
-    - path: "//a[starts-with(@href, 'https://doi.org/') or starts-with(@href, 'http://dx.doi.org/')]/@href" # Fallback to href if text is not DOI
-  item_page_url: # Canonical URL of the item page itself
-    - path: "//link[@rel='canonical']/@href"
-    - path: "//meta[@name='DC.identifier.uri']/@content"
-    - path: "//meta[@name='citation_abstract_html_url']/@content"
+  # Selectores para metadatos individuales en la página del ítem (si se necesitan complementar desde HTML)
+  # Estos son ejemplos y necesitarían verificación; OAI es la fuente primaria.
+  title: "meta[name='DC.title']@content"
+  author: "meta[name='DC.creator']@content" # Puede haber múltiples
+  date_issued: "meta[name='DCTERMS.issued']@content"
+  abstract: "meta[name='DCTERMS.abstract']@content"
+  keywords: "meta[name='DC.subject']@content" # Puede haber múltiples
+  doi: "meta[name='DC.identifier.doi']@content"
+  handle_url: "meta[name='DC.identifier.uri']@content"
 
+# Selectores para la búsqueda web en el portal principal (estrategia secundaria)
+# Estos son placeholders y requerirían un análisis detallado si se activa esta estrategia.
+main_portal_search_results:
+  result_item: ".search-result-item-class" # Placeholder
+  item_title: ".item-title-class" # Placeholder
+  item_url: ".item-url-class@href" # Placeholder
+  next_page_link: "a.next-page-class@href" # Placeholder (ej. "Próxima página")
 
-# Selectors for web search results (Embrapa main site search)
-# These are highly dependent on the specific structure of Embrapa's search results page.
-# Placeholder - to be filled after analyzing Embrapa's search results page structure.
-web_search_results_selectors:
-  item_container: "" # XPath to the repeating element that contains each search result item
-  title: ""          # XPath relative to item_container for the title
-  link_to_item_page: "" # XPath relative to item_container for the link to the item's detail page
-  next_page_link: ""    # XPath for the "next page" link in pagination
+# Selectors for Embrapa (BR)
 
-# Selectors for OAI harvesting (these are not XPaths for HTML, but keys for parsing OAI XML)
-# This section is more of a conceptual guide as OAI parsing is usually done with XML libraries directly.
-oai_selectors:
-  record_identifier: "{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}identifier"
-  datestamp: "{http://www.openarchives.org/OAI/2.0/}header/{http://www.openarchives.org/OAI/2.0/}datestamp"
-  # Dublin Core metadata elements (prefix 'oai_dc:dc' for OAI-PMH with Dublin Core)
-  dc_title: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}title"
-  dc_creator: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}creator"
-  dc_subject: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}subject"
-  dc_description: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}description"
-  dc_publisher: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}publisher"
-  dc_contributor: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}contributor"
-  dc_date: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}date" # Often the publication date
-  dc_type: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}type"
-  dc_format: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}format" # Can indicate 'application/pdf'
-  dc_identifier: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}identifier" # Can be URL, DOI, etc.
-  dc_source: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}source"
-  dc_language: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}language"
-  dc_relation: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}relation"
-  dc_coverage: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}coverage"
-  dc_rights: "{http://www.openarchives.org/OAI/2.0/}metadata/{http://purl.org/dc/elements/1.1/}rights"
-  resumption_token: "{http://www.openarchives.org/OAI/2.0/}ListRecords/{http://www.openarchives.org/OAI/2.0/}resumptionToken"
+# OAI Harvester Selectors (Placeholder - to be defined if OAI is used)
+# oai_harvester_br:
+#   record_xpath: ""
+#   identifier_xpath: ""
+#   # ... other OAI specific xpaths
+
+# HTML Metadata Extractor Selectors for DSpace item page (Example, adapt as needed)
+html_metadata_extractor_br:
+  # For extracting the direct PDF link from an item's HTML page
+  # This selector targets an <a> tag within a div with class 'file-link' and an href ending in '.pdf'
+  # It was derived from the analysis of Alice DSpace item pages.
+  pdf_link_xpath: "//div[contains(@class, 'file-link')]//a[contains(@href, '.pdf')]/@href"
+
+  # Selectors for specific metadata fields (examples, verify and complete)
+  dc_title_xpath: "//meta[@name='DC.title']/@content"
+  dc_creator_xpath: "//meta[@name='DC.creator']/@content"
+  dc_subject_xpath: "//meta[@name='DC.subject']/@content"
+  dc_description_abstract_xpath: "//meta[@name='DCTERMS.abstract']/@content"
+  dc_date_issued_xpath: "//meta[@name='DCTERMS.issued']/@content"
+  dc_identifier_uri_xpath: "//meta[@name='DC.identifier.uri']/@content"
+  dc_publisher_xpath: "//meta[@name='DC.publisher']/@content"
+  dc_language_xpath: "//meta[@name='DC.language.iso']/@content"
+  citation_journal_title_xpath: "//meta[@name='citation_journal_title']/@content"
+  citation_pdf_url_xpath: "//meta[@name='citation_pdf_url']/@content" # Alternative PDF link
+
+# Keyword Searcher Selectors for Embrapa Portal
+keyword_search_embrapa:
+  # Contenedor principal para cada resultado de búsqueda
+  # Apunta al div que tiene un ID que contiene '_publicacao-' dentro del contenedor principal de documentos
+  result_item_container: "//div[contains(@id, '_buscapublicacao_WAR_pcebusca6_1portlet_publicacao-')]"
+  # Selector relativo al contenedor para el enlace del título
+  result_item_title_link: ".//div[@class='titulo']/a"
+  # Selector relativo al contenedor para extraer el href del enlace del título
+  result_item_url: ".//div[@class='titulo']/a/@href"
+  # Selector para el enlace de paginación 'Próximo'
+  next_page_link: "//ul[contains(@class, 'lfr-pagination-buttons')]//a[normalize-space(text())='Próximo']"
+  # Selector para extraer el texto que indica el total de resultados (opcional, podría necesitar regex)
+  total_results_text: "//small[contains(@class, 'search-results')]/text()" # Ajustado para el tag <small> 
