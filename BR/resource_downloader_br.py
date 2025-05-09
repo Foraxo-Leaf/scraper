@@ -1,430 +1,337 @@
-# BR/resource_downloader_br.py
 import requests
-import os
-import time
-import hashlib
-from urllib.parse import urlparse, unquote
 import logging
+import os
+import hashlib
+import time
+from urllib.parse import urlparse
 
-def calculate_md5_util(file_path, logger_instance):
-    """Calcula el hash MD5 de un archivo."""
-    hash_md5 = hashlib.md5()
-    try:
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-    except FileNotFoundError:
-        logger_instance.error(f"Archivo no encontrado para calcular MD5: {file_path}")
-        return None
-    except Exception as e:
-        logger_instance.error(f"Error calculando MD5 para {file_path}: {e}")
-        return None
+# Define default status constants if not imported from db_manager
+# These should ideally be consistent with DatabaseManagerBR constants
+FILE_DOWNLOAD_SUCCESS = "success"
+FILE_DOWNLOAD_FAILED = "failed"
+FILE_DOWNLOAD_SKIPPED_EXIST = "skipped_exist"
+FILE_TYPE_PDF = "pdf"
+FILE_TYPE_HTML_SNAPSHOT = "html_snapshot"
 
 class ResourceDownloaderBR:
-    def __init__(self, config, logger_instance=None, db_manager_instance=None, module_br_root_dir=None):
+    """
+    Handles downloading resources like PDFs and HTML snapshots for the Brazil scraper.
+    Manages file paths, retries, and MD5 hash calculation.
+    """
+
+    def __init__(self, config, logger=None, db_manager=None):
+        """
+        Initializes the ResourceDownloaderBR.
+
+        Args:
+            config (dict): Configuration dictionary.
+            logger (logging.Logger, optional): Logger instance.
+            db_manager (DatabaseManagerBR, optional): Database manager for logging download results.
+        """
         self.config = config
-        if logger_instance:
-            self.logger = logger_instance
-        else:
-            self.logger = logging.getLogger("ResourceDownloaderBR")
-            if not self.logger.handlers:
-                handler = logging.StreamHandler()
-                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-                handler.setFormatter(formatter)
-                self.logger.addHandler(handler)
-                self.logger.setLevel(logging.INFO)
+        self.logger = logger or logging.getLogger(__name__)
+        self.db_manager = db_manager # For logging results back to the DB
+
+        self.base_output_dir = config.get('base_output_directory', 'BR/output')
+        self.pdf_dir_name = config.get('pdf_subdirectory', 'pdfs')
+        self.html_dir_name = config.get('html_snapshot_subdirectory', 'html_snapshot')
         
-        self.db_manager = db_manager_instance
-        if not self.db_manager:
-            self.logger.critical("ResourceDownloaderBR inicializado sin una instancia de DatabaseManager. Las operaciones de BD fallarán.")
+        self.download_retries = config.get('download_retries', 3)
+        self.download_delay_retry_seconds = config.get('download_delay_retry_seconds', 5)
+        self.download_timeout = config.get('download_timeout_seconds', 120) # Generous timeout for PDFs
+        self.user_agent = config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36')
+        
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': self.user_agent})
+        
+        # Ensure base output directories exist
+        self._ensure_directory_exists(os.path.join(self.base_output_dir, self.pdf_dir_name))
+        self._ensure_directory_exists(os.path.join(self.base_output_dir, self.html_dir_name))
 
-        if not module_br_root_dir:
-            # Fallback si no se pasa, aunque ScraperBR debería pasarlo.
-            # Esto haría que las rutas sean relativas al CWD si no se pasa, lo cual queremos evitar.
-            self.logger.warning("module_br_root_dir no fue proporcionado a ResourceDownloaderBR. Las rutas podrían no ser relativas al módulo BR.")
-            self.module_br_root_dir = os.getcwd() # Comportamiento anterior como fallback
-        else:
-            self.module_br_root_dir = module_br_root_dir
-
-        # Usar output_path de la config, que ahora es relativo al módulo BR
-        base_output_dir_relative = self.config.get('output_path', 'output') 
-        self.base_output_dir_absolute = os.path.join(self.module_br_root_dir, base_output_dir_relative)
-
-        self.delay_seconds = self.config.get('download_delay_seconds', 1)
-        self.max_retries = self.config.get('max_retries', 3)
-        # Usar un timeout de descarga más largo que el de requests generales
-        self.download_timeout = self.config.get('download_timeout', self.config.get('request_timeout', 60) * 2) 
-        self.user_agent = self.config.get('user_agent', 'GenericScraper/1.0')
-        self.retry_base_delay = self.config.get('download_base_retry_delay', 5) # Para backoff
-
-    def _ensure_dir_exists(self, file_path):
-        """Asegura que el directorio para un archivo exista."""
-        directory = os.path.dirname(file_path)
-        if not os.path.exists(directory):
+    def _ensure_directory_exists(self, dir_path):
+        """Creates a directory if it doesn't exist."""
+        if not os.path.exists(dir_path):
             try:
-                os.makedirs(directory, exist_ok=True)
-                self.logger.debug(f"Directorio creado: {directory}")
+                os.makedirs(dir_path, exist_ok=True)
+                self.logger.info(f"Created directory: {dir_path}")
             except OSError as e:
-                self.logger.error(f"Error creando directorio {directory}: {e}")
-                raise # Propagar el error si no se puede crear el directorio
+                self.logger.error(f"Error creating directory {dir_path}: {e}")
+                raise # Or handle more gracefully if preferred
 
-    def _build_local_path(self, item_id, file_type_group, remote_url_for_filename, desired_extension=None):
-        """Construye la ruta de archivo local basada en item_id, tipo y URL remota."""
-        if item_id is None:
-            self.logger.error("_build_local_path llamado con item_id None.")
-            return None
+    def _get_local_file_path(self, item_id, resource_url, resource_type):
+        """
+        Determines the local file path for a downloaded resource.
+        Creates a subdirectory for each item_id to organize files.
+
+        Args:
+            item_id (int or str): The ID of the item this resource belongs to.
+            resource_url (str): The URL of the resource, used to derive a filename.
+            resource_type (str): 'pdf' or 'html_snapshot'.
+
+        Returns:
+            str: The absolute local file path.
+        """
+        if resource_type == FILE_TYPE_PDF:
+            type_dir = self.pdf_dir_name
+            file_extension = ".pdf"
+        elif resource_type == FILE_TYPE_HTML_SNAPSHOT:
+            type_dir = self.html_dir_name
+            file_extension = ".html"
+        else:
+            self.logger.warning(f"Unknown resource type: {resource_type}. Defaulting to '.dat' extension and 'unknown_type' directory.")
+            type_dir = "unknown_type"
+            file_extension = ".dat"
+
+        # Create a directory for the item if it doesn't exist
+        item_specific_dir = os.path.join(self.base_output_dir, type_dir, str(item_id))
+        self._ensure_directory_exists(item_specific_dir)
+
+        # Generate a filename from the URL
         try:
-            # Simplificado: crear un nombre de archivo basado en el item_id y un hash de la URL si es necesario
-            # y el tipo de archivo.
-            # El file_type_group sería 'pdfs', 'html_snapshot', etc.
-            url_path = urlparse(remote_url_for_filename).path
-            filename_base = os.path.basename(url_path).split('?')[0] if url_path else "file"
-            safe_filename = "".join([c for c in filename_base if c.isalnum() or c in ('-', '_', '.')]).rstrip('. ')
+            parsed_url = urlparse(resource_url)
+            base_filename = os.path.basename(parsed_url.path)
+            if not base_filename or not base_filename.endswith(file_extension):
+                 # If basename is empty or doesn't have the expected extension, create a generic one
+                 # or use a hash of the URL if filenames are not predictable
+                if resource_type == FILE_TYPE_PDF and not base_filename.lower().endswith('.pdf'):
+                    base_filename = f"{hashlib.md5(resource_url.encode('utf-8')).hexdigest()}{file_extension}"
+                elif resource_type == FILE_TYPE_HTML_SNAPSHOT:
+                     base_filename = f"snapshot_{hashlib.md5(resource_url.encode('utf-8')).hexdigest()}{file_extension}"
+                else: # Fallback for other types or if still no good name
+                    base_filename = f"downloaded_resource{file_extension}"
             
-            if not safe_filename or len(safe_filename) > 100: # Si es vacío o muy largo
-                # Usar un hash de la URL para asegurar unicidad y longitud razonable
-                safe_filename = hashlib.md5(remote_url_for_filename.encode()).hexdigest()[:16]
+            # Sanitize filename (simple version, could be more robust)
+            safe_filename = "".join(c for c in base_filename if c.isalnum() or c in ('.', '-', '_')).strip()
+            if not safe_filename:
+                safe_filename = f"default_filename{file_extension}"
 
-            # Determinar extensión
-            file_extension = desired_extension
-            if not file_extension:
-                # Intentar obtenerla del nombre de archivo si existe y es razonable
-                _, ext_from_name = os.path.splitext(safe_filename)
-                if ext_from_name and len(ext_from_name) <= 5 and ext_from_name.startswith('.'):
-                    file_extension = ext_from_name
-                else: # Fallback a .dat o algo genérico si no se puede determinar
-                    file_extension = '.dat' 
-            
-            if not safe_filename.endswith(file_extension):
-                # Quitar cualquier extensión previa si vamos a añadir una nueva
-                name_part_only, _ = os.path.splitext(safe_filename)
-                safe_filename = name_part_only + file_extension
-            
-            # Asegurar que el nombre no sea solo la extensión (ej. ".pdf")
-            if safe_filename == file_extension:
-                safe_filename = hashlib.md5(remote_url_for_filename.encode()).hexdigest()[:16] + file_extension
-
-            # Usar self.base_output_dir_absolute
-            target_dir = os.path.join(self.base_output_dir_absolute, file_type_group, str(item_id))
-            os.makedirs(target_dir, exist_ok=True)
-            final_path = os.path.join(target_dir, safe_filename)
-            
-            # Truncar si la ruta completa es demasiado larga (raro, pero posible en algunos OS)
-            max_path_len = 255 # Límite común
-            if len(final_path) > max_path_len:
-                name_part, ext_part = os.path.splitext(safe_filename)
-                allowed_name_len = max_path_len - len(os.path.join(target_dir, '')) - len(ext_part) -1 # -1 por si acaso
-                if allowed_name_len < 5: # No tiene sentido si el nombre es muy corto
-                    self.logger.error(f"La ruta base es demasiado larga para crear un archivo válido en {target_dir}")
-                    return None
-                truncated_name = name_part[:allowed_name_len]
-                final_path = os.path.join(target_dir, truncated_name + ext_part)
-                self.logger.warning(f"La ruta del archivo ha sido truncada a: {final_path}")
-
-            return final_path
         except Exception as e:
-            self.logger.error(f"Error creando ruta local para item {item_id}, tipo {file_type_group}, url {remote_url_for_filename}: {e}", exc_info=True)
+            self.logger.error(f"Error parsing resource URL '{resource_url}' for filename: {e}")
+            safe_filename = f"error_filename_{hashlib.md5(resource_url.encode('utf-8')).hexdigest()}{file_extension}"
+            
+        return os.path.join(item_specific_dir, safe_filename)
+
+    def calculate_md5(self, file_path):
+        """Calculates the MD5 hash of a file."""
+        hash_md5 = hashlib.md5()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except IOError as e:
+            self.logger.error(f"Error reading file {file_path} for MD5 calculation: {e}")
             return None
 
-    def _cleanup_partial_file(self, file_path):
-        """Intenta eliminar un archivo parcial si existe después de un error de descarga."""
-        if file_path and os.path.exists(file_path):
+    def download_resource(self, item_id, resource_url, resource_type, force_download=False):
+        """
+        Downloads a resource (PDF or HTML) from a given URL.
+
+        Args:
+            item_id (int): The ID of the item this resource belongs to.
+            resource_url (str): The URL of the resource to download.
+            resource_type (str): Type of resource ('pdf', 'html_snapshot').
+            force_download (bool): If True, download even if file exists (and potentially verified).
+
+        Returns:
+            tuple: (success (bool), local_path (str) or None, md5_hash (str) or None, file_size (int) or None)
+        """
+        if not resource_url or not resource_url.startswith(('http://', 'https://')):
+            self.logger.error(f"Invalid or missing resource URL provided for item {item_id}: '{resource_url}'")
+            if self.db_manager:
+                # Need a placeholder local_path for logging failure if URL is truly bad
+                placeholder_path = os.path.join(self.base_output_dir, resource_type, str(item_id), "download_failed_invalid_url.err")
+                self.db_manager.log_file_download(item_id, resource_type, resource_url, placeholder_path, FILE_DOWNLOAD_FAILED)
+            return False, None, None, None
+
+        local_path = self._get_local_file_path(item_id, resource_url, resource_type)
+        md5sum = None
+        file_size = None
+        download_outcome_status = FILE_DOWNLOAD_FAILED # Default to failure
+
+        # Check if file exists and if we should skip download
+        if os.path.exists(local_path) and not force_download:
+            self.logger.info(f"Resource already exists at {local_path}. Verifying...")
+            md5sum = self.calculate_md5(local_path)
+            file_size = os.path.getsize(local_path)
+            # Here, you might want to check against DB if MD5 matches a previously successful download.
+            # For simplicity, if it exists and not forcing, we assume it's okay.
+            self.logger.info(f"Skipping download for existing file: {local_path}. MD5: {md5sum}, Size: {file_size} bytes.")
+            download_outcome_status = FILE_DOWNLOAD_SKIPPED_EXIST
+            if self.db_manager:
+                 self.db_manager.log_file_download(item_id, resource_type, resource_url, local_path, 
+                                                 download_outcome_status, md5sum, file_size)
+            return True, local_path, md5sum, file_size # Considered success as file is present
+
+        self.logger.info(f"Attempting to download {resource_type} for item {item_id} from {resource_url} to {local_path}")
+        
+        for attempt in range(self.download_retries):
             try:
-                os.remove(file_path)
-                self.logger.info(f"Eliminado archivo parcial/fallido: {file_path}")
-            except OSError as oe:
-                self.logger.warning(f"Error eliminando archivo parcial {file_path}: {oe}")
-
-    def download_resource(self, item_id, file_type, remote_url, is_snapshot=False):
-        result = {
-            'status': 'pending',
-            'local_path': None,
-            'md5': None,
-            'size': None,
-            'remote_url': remote_url,
-            'file_type': file_type
-        }
-
-        if not remote_url:
-            self.logger.warning(f"[Item {item_id}] No se proporcionó URL remota para descargar tipo '{file_type}'.")
-            result['status'] = 'failed_no_remote_url'
-            return result['status']
-        
-        if item_id is None: 
-            self.logger.error(f"[ResourceDownloader] item_id es None para URL '{remote_url}'. No se puede descargar.")
-            result['status'] = 'failed_item_id_none'
-            return result['status']
-        
-        # Determinar la extensión deseada para _build_local_path
-        desired_ext = None
-        if file_type == 'pdf':
-            desired_ext = '.pdf'
-        elif file_type.startswith('image'): # Ej: 'image_thumbnail', 'image_cover'
-            # Intentar obtener la extensión de la URL si es una imagen común, sino default a .jpg
-            _, ext_from_url = os.path.splitext(urlparse(remote_url).path)
-            if ext_from_url.lower() in ['.jpg', '.jpeg', '.png', '.gif']:
-                desired_ext = ext_from_url.lower()
-            else:
-                desired_ext = '.jpg' # Default para imágenes desconocidas
-        # Para html_snapshot, _build_local_path ya añade .html si desired_extension es None y el nombre no lo tiene
-        # Pero es mejor ser explícito si save_html_snapshot lo llama directamente. Este método es más genérico.
-
-        local_path_target = self._build_local_path(item_id, file_type, remote_url, desired_extension=desired_ext)
-        if not local_path_target:
-            result['status'] = 'error_path_creation'
-            self.db_manager.log_file_result(item_id, file_type, remote_url, result['status'], None, None, None)
-            return result['status']
-        
-        result['local_path'] = local_path_target
-
-        # Verificar si el archivo ya existe y está OK (esta lógica estaba en el Scraper AR)
-        existing_db_status, existing_db_path = self.db_manager.get_file_status(item_id, remote_url)
-        if existing_db_status in ['downloaded', 'skipped_exists']:
-            if existing_db_path and os.path.exists(existing_db_path):
-                 self.logger.info(f"[Item {item_id}] Archivo '{file_type}' ({remote_url}) ya procesado y existe en BD/disco ({existing_db_status} en {existing_db_path}). Saltando descarga.")
-                 return existing_db_status
-            else:
-                 self.logger.warning(f"[Item {item_id}] Archivo '{file_type}' ({remote_url}) marcado como '{existing_db_status}' en BD pero no encontrado en disco en '{existing_db_path}'. Se intentará descargar de nuevo.")
-
-        attempts = 0
-        download_successful = False
-        while attempts <= self.max_retries:
-            try:
-                if attempts > 0:
-                    retry_delay = self.retry_base_delay * (2 ** (attempts - 1))
-                    self.logger.info(f"[Item {item_id}] Reintento {attempts}/{self.max_retries} para '{remote_url}' en {retry_delay}s...")
-                    time.sleep(retry_delay)
-                
-                self.logger.info(f"[Item {item_id}] Descargando {file_type} desde: {remote_url} -> {local_path_target} (Intento {attempts + 1})")
-                headers = {'User-Agent': self.user_agent}
-                
-                response = requests.get(remote_url, stream=True, timeout=self.download_timeout, headers=headers)
+                # Use stream=True for large files like PDFs to avoid loading entirely into memory
+                is_streaming = resource_type == FILE_TYPE_PDF
+                response = self.session.get(resource_url, timeout=self.download_timeout, stream=is_streaming, allow_redirects=True)
                 response.raise_for_status()
 
-                with open(local_path_target, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                # Check content type, especially for PDFs
+                content_type = response.headers.get('Content-Type', '').lower()
+                if resource_type == FILE_TYPE_PDF and 'application/pdf' not in content_type:
+                    self.logger.warning(f"Content-Type for {resource_url} is '{content_type}', not 'application/pdf'. File may not be a PDF.")
+                    # Decide if to proceed or fail. For now, proceed but log.
+                elif resource_type == FILE_TYPE_HTML_SNAPSHOT and 'text/html' not in content_type:
+                     self.logger.warning(f"Content-Type for {resource_url} is '{content_type}', not 'text/html'. File may not be HTML.")
+
+                with open(local_path, 'wb') as f:
+                    if is_streaming:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk: # filter out keep-alive new chunks
+                                f.write(chunk)
+                    else: # For HTML or small files if not streaming
+                        f.write(response.content)
                 
-                self.logger.info(f"[Item {item_id}] {file_type} descargado en: {local_path_target}")
-                if self.delay_seconds > 0 and attempts == 0:
-                    time.sleep(self.delay_seconds / 2)
+                file_size = os.path.getsize(local_path)
+                md5sum = self.calculate_md5(local_path)
+                self.logger.info(f"Successfully downloaded {resource_type} to {local_path} (Size: {file_size} bytes, MD5: {md5sum})")
+                download_outcome_status = FILE_DOWNLOAD_SUCCESS
+                if self.db_manager:
+                    self.db_manager.log_file_download(item_id, resource_type, resource_url, local_path, 
+                                                     download_outcome_status, md5sum, file_size)
+                return True, local_path, md5sum, file_size
 
-                result['size'] = os.path.getsize(local_path_target)
-                result['md5'] = calculate_md5_util(local_path_target, self.logger)
-                result['status'] = "downloaded"
-                download_successful = True
-                break 
-            except requests.exceptions.Timeout:
-                self.logger.warning(f"[Item {item_id}] Timeout descargando {file_type} '{remote_url}' (Intento {attempts + 1})")
-                self._cleanup_partial_file(local_path_target)
-                result['status'] = "error_timeout"
-            except requests.exceptions.HTTPError as http_err:
-                status_code = http_err.response.status_code if http_err.response is not None else 'N/A'
-                self.logger.warning(f"[Item {item_id}] Error HTTP {status_code} descargando {file_type} '{remote_url}' (Intento {attempts + 1}).")
-                self._cleanup_partial_file(local_path_target)
-                result['status'] = f"error_http_{status_code}"
-                if 400 <= (status_code if isinstance(status_code, int) else 0) < 500 and status_code not in [408, 429]:
-                    break 
-            except requests.exceptions.RequestException as req_err:
-                self.logger.warning(f"[Item {item_id}] Error de red descargando {file_type} '{remote_url}' (Intento {attempts + 1}): {req_err}")
-                self._cleanup_partial_file(local_path_target)
-                result['status'] = "error_network"
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"Download attempt {attempt + 1}/{self.download_retries} for {resource_url} failed: {e}")
+                if attempt < self.download_retries - 1:
+                    time.sleep(self.download_delay_retry_seconds)
+                else:
+                    self.logger.error(f"All {self.download_retries} download attempts failed for {resource_url}.")
+                    download_outcome_status = FILE_DOWNLOAD_FAILED
+            except IOError as e:
+                 self.logger.error(f"File I/O error during download of {resource_url} to {local_path}: {e}")
+                 download_outcome_status = FILE_DOWNLOAD_FAILED
+                 break # Don't retry on local file system errors
             except Exception as e:
-                self.logger.error(f"[Item {item_id}] Error inesperado descargando {file_type} '{remote_url}' (Intento {attempts + 1}): {e}", exc_info=True)
-                self._cleanup_partial_file(local_path_target)
-                result['status'] = "error_exception"
-                break 
-            attempts += 1
-        
-        if not download_successful and attempts > self.max_retries:
-            self.logger.error(f"[Item {item_id}] Máximos reintentos ({self.max_retries}) alcanzados para {file_type} '{remote_url}'. Falló con: {result['status']}")
-        
-        # Registrar el resultado final en la BD
-        self.db_manager.log_file_result(
-            item_id,
-            result['file_type'],
-            result['remote_url'],
-            result['status'],
-            result['local_path'] if download_successful else local_path_target,
-            result['md5'],
-            result['size']
-        )
-        return result['status']
+                self.logger.error(f"An unexpected error occurred during download of {resource_url}: {e}")
+                download_outcome_status = FILE_DOWNLOAD_FAILED
+                break # Don't retry on unknown errors
 
-    def save_html_snapshot(self, item_id, page_url, html_content_str):
-        """Guarda el contenido HTML como un archivo local y lo registra en la BD."""
-        if item_id is None:
-            self.logger.error("Se intentó guardar snapshot HTML con item_id None.")
-            return None
+        # If loop finishes without successful download
+        if self.db_manager:
+             self.db_manager.log_file_download(item_id, resource_type, resource_url, local_path, 
+                                             download_outcome_status, None, None)
+        return False, local_path, None, None # Return local_path even on failure for logging purposes
 
-        file_type_group = 'html_snapshot'
-        local_path = self._build_local_path(item_id, file_type_group, page_url, desired_extension='.html') 
+    def get_html_content(self, url, item_id_for_snapshot=None, save_snapshot=False):
+        """
+        Fetches HTML content from a URL. Optionally saves a snapshot.
+        This method is for cases where KeywordSearcher or HTMLMetadataExtractor might need direct HTML content.
+        It's distinct from download_resource which is for primary PDF/HTML downloads logged to DB.
 
-        if not local_path:
-            self.logger.error(f"[Item {item_id}] No se pudo construir la ruta local para el snapshot HTML de {page_url}")
-            self.db_manager.log_file_result(
-                item_id=item_id, 
-                file_type=file_type_group, 
-                remote_url=page_url, 
-                local_path=None, 
-                download_status='error_path_creation', 
-                md5_hash=None, 
-                file_size_bytes=None
-            )
-            return None
-        
+        Args:
+            url (str): The URL to fetch.
+            item_id_for_snapshot (int, optional): If provided and save_snapshot is True,
+                                                 the HTML will be saved as a snapshot for this item_id.
+            save_snapshot (bool): Whether to save the fetched HTML as a snapshot.
+
+        Returns:
+            str: The HTML content as text, or None on failure.
+        """
         try:
-            with open(local_path, 'w', encoding='utf-8') as f:
-                f.write(html_content_str)
-            
-            file_size = os.path.getsize(local_path)
-            md5_hash = hashlib.md5(html_content_str.encode('utf-8')).hexdigest()
-            
-            self.logger.info(f"[Item {item_id}] Snapshot HTML guardado en: {local_path} ({file_size} bytes)")
-            
-            self.db_manager.log_file_result(
-                item_id=item_id,
-                file_type=file_type_group,
-                remote_url=page_url, 
-                local_path=local_path,
-                download_status='downloaded',
-                md5_hash=md5_hash,
-                file_size_bytes=file_size
-            )
-            return local_path
-        except IOError as e:
-            self.logger.error(f"[Item {item_id}] Error de I/O guardando snapshot HTML en {local_path}: {e}")
-        except Exception as e:
-            self.logger.error(f"[Item {item_id}] Error inesperado guardando snapshot HTML en {local_path}: {e}", exc_info=True)
-        
-        self.db_manager.log_file_result(
-            item_id=item_id, 
-            file_type=file_type_group, 
-            remote_url=page_url, 
-            local_path=local_path, 
-            download_status='error_saving_snapshot', 
-            md5_hash=None, 
-            file_size_bytes=None
-        )
-        return None
+            response = self.session.get(url, timeout=self.download_timeout) # Shorter timeout for general HTML?
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding if response.apparent_encoding else 'utf-8'
+            html_text = response.text
 
-    # Nuevo método para obtener snapshots HTML
-    def fetch_html_snapshot(self, url, item_id_for_path):
-        """Obtiene el contenido HTML de una URL y lo guarda como snapshot."""
-        self.logger.debug(f"Intentando obtener snapshot HTML para item {item_id_for_path} desde {url}")
-        snapshot_content = None
-        snapshot_path = None
-        
-        # Construir la ruta de guardado para el snapshot
-        snapshot_dir = os.path.join(self.config.get('output_dir', 'BR/output'), 'html_snapshot', str(item_id_for_path))
-        snapshot_filename = f"item_{item_id_for_path}_snapshot.html"
-        snapshot_path = os.path.join(snapshot_dir, snapshot_filename)
-
-        try:
-            headers = {'User-Agent': self.user_agent}
-            response = requests.get(url, headers=headers, timeout=self.download_timeout, allow_redirects=True)
-            response.raise_for_status() # Lanza excepción para códigos 4xx/5xx
-            snapshot_content = response.text # Usar .text para HTML
-            self.logger.debug(f"HTML obtenido exitosamente para {url} (item {item_id_for_path}). Tamaño: {len(snapshot_content)} bytes.")
-
-            # Guardar el snapshot
-            os.makedirs(snapshot_dir, exist_ok=True)
-            with open(snapshot_path, 'w', encoding='utf-8') as f:
-                f.write(snapshot_content)
-            self.logger.info(f"Snapshot HTML guardado para item {item_id_for_path} en: {snapshot_path}")
-            
-        except requests.exceptions.Timeout:
-            self.logger.warning(f"Timeout obteniendo HTML snapshot para {url} (item {item_id_for_path})")
-            # Podríamos querer registrar este fallo en la tabla items?
-        except requests.exceptions.HTTPError as e:
-             self.logger.warning(f"Error HTTP {e.response.status_code} obteniendo HTML snapshot para {url} (item {item_id_for_path})")
+            if save_snapshot and item_id_for_snapshot is not None:
+                self.logger.debug(f"Saving HTML snapshot for item {item_id_for_snapshot} from {url}")
+                # Use download_resource to leverage its path generation and (optional) DB logging
+                # Here, we are just saving it. DB logging for snapshots is typically handled by the caller if needed.
+                snapshot_local_path = self._get_local_file_path(item_id_for_snapshot, url, FILE_TYPE_HTML_SNAPSHOT)
+                try:
+                    with open(snapshot_local_path, 'w', encoding='utf-8') as f:
+                        f.write(html_text)
+                    self.logger.info(f"HTML snapshot saved to {snapshot_local_path}")
+                except IOError as e:
+                    self.logger.error(f"Failed to save HTML snapshot to {snapshot_local_path}: {e}")
+            return html_text
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error de red obteniendo HTML snapshot para {url} (item {item_id_for_path}): {e}")
-        except IOError as e:
-             self.logger.error(f"Error de I/O guardando HTML snapshot en {snapshot_path} (item {item_id_for_path}): {e}")
+            self.logger.error(f"Failed to get HTML content from {url}: {e}")
+            return None
         except Exception as e:
-            self.logger.error(f"Error inesperado obteniendo/guardando HTML snapshot para {url} (item {item_id_for_path}): {e}", exc_info=True)
-            snapshot_content = None # Asegurar que no se devuelva contenido parcial en error inesperado
-            snapshot_path = None # No devolver path si hubo error grave
+            self.logger.error(f"Unexpected error in get_html_content for {url}: {e}")
+            return None
 
-        return snapshot_content, snapshot_path
-
-# Ejemplo de uso básico (para pruebas)
+# Example Usage (Illustrative)
 if __name__ == '__main__':
-    print("Ejecutando pruebas básicas de ResourceDownloaderBR...")
-    test_logger = logging.getLogger("ResourceDownloaderTest")
-    test_logger.setLevel(logging.DEBUG)
-    test_handler = logging.StreamHandler()
-    test_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    test_handler.setFormatter(test_formatter)
-    if not test_logger.handlers: test_logger.addHandler(test_handler)
+    # Setup basic logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    example_logger = logging.getLogger("ResourceDownloaderBRExample")
 
-    # Configuración de prueba
-    test_config = {
-        "output_dir": "BR/output_test_downloader", # Directorio de prueba
-        "download_delay_seconds": 0.1,
-        "max_retries": 1,
-        "download_timeout": 10,
-        "user_agent": "TestDownloader/1.0",
-        "download_base_retry_delay": 1
+    # Mock configuration
+    mock_config_data = {
+        'base_output_directory': 'BR_downloader_test_output',
+        'pdf_subdirectory': 'test_pdfs',
+        'html_snapshot_subdirectory': 'test_html',
+        'download_retries': 2,
+        'download_delay_retry_seconds': 1,
+        'download_timeout_seconds': 10,
+        'user_agent': 'TestDownloader/1.0'
     }
-    # Asegurar que el directorio de prueba exista y esté limpio
-    if os.path.exists(test_config["output_dir"]):
+
+    # Mock DB Manager (optional, for full testing of DB logging)
+    class MockDBForDownloader:
+        def log_file_download(self, item_id, file_type, file_url, local_path, download_status, md5_hash=None, file_size_bytes=None):
+            example_logger.info(f"DB_LOG: item_id={item_id}, type={file_type}, url={file_url}, path={local_path}, status={download_status}, md5={md5_hash}, size={file_size_bytes}")
+
+    # Clean up previous test output if it exists
+    if os.path.exists(mock_config_data['base_output_directory']):
         import shutil
-        shutil.rmtree(test_config["output_dir"])
-    os.makedirs(test_config["output_dir"], exist_ok=True)
+        shutil.rmtree(mock_config_data['base_output_directory'])
+        example_logger.info(f"Removed previous test output directory: {mock_config_data['base_output_directory']}")
 
-    downloader = ResourceDownloaderBR(test_config, logger_instance=test_logger)
+    downloader = ResourceDownloaderBR(config=mock_config_data, logger=example_logger, db_manager=MockDBForDownloader())
 
-    test_logger.info("--- Probando descarga de PDF (ejemplo real) ---")
-    # Se necesita un item_id y una URL de PDF real y pequeña para probar
-    # Usaremos el ejemplo de BR/analysis.json, pero solo si es accesible y pequeño
-    # Por ahora, un placeholder, ya que no quiero descargas reales en esta prueba unitaria.
-    # pdf_item_id = "test_pdf_item_001"
-    # pdf_url_real = "https://www.infoteca.cnptia.embrapa.br/infoteca/bitstream/doc/1175312/1/BA-04-2025.pdf" # Ejemplo
-    # pdf_result = downloader.download_pdf(pdf_item_id, pdf_url_real)
-    # test_logger.info(f"Resultado descarga PDF: {pdf_result}")
-    # if pdf_result['status'] == 'downloaded':
-    #     assert os.path.exists(pdf_result['local_path'])
-    #     assert pdf_result['md5'] is not None
-    #     assert pdf_result['size'] > 0
-    #     test_logger.info(f"PDF descargado en: {pdf_result['local_path']}")
-    test_logger.info("Prueba de PDF real comentada para evitar descargas no deseadas en tests básicos.")
+    example_logger.info("ResourceDownloaderBR initialized for example.")
 
-    test_logger.info("--- Probando descarga de HTML Snapshot (ejemplo) ---")
-    html_item_id = "test_html_item_001"
-    html_page_url = "https://www.embrapa.br/"
-    html_result = downloader.download_html_snapshot(html_item_id, html_page_url)
-    test_logger.info(f"Resultado descarga HTML: {html_result}")
-    if html_result['status'] == 'downloaded':
-        assert os.path.exists(html_result['local_path'])
-        assert html_result['size'] > 0
-        # MD5 no se calcula para snapshots HTML por defecto
-        test_logger.info(f"HTML Snapshot descargado en: {html_result['local_path']}")
-    
-    test_logger.info("--- Probando URL inválida/no existente ---")
-    invalid_url_item_id = "test_invalid_001"
-    invalid_url = "http://thissitedoesnotexist.invalid/file.pdf"
-    invalid_result = downloader.download_pdf(invalid_url_item_id, invalid_url)
-    test_logger.info(f"Resultado URL inválida: {invalid_result}")
-    assert invalid_result['status'].startswith("failed")
+    # Test PDF download (using a public domain PDF for testing)
+    # Replace with a real, stable PDF URL from Embrapa if possible for more relevant testing
+    # For this example, using a known small public PDF often used for tests.
+    test_pdf_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" 
+    test_item_id_pdf = 101
 
-    test_logger.info("--- Probando _build_local_path con varios nombres ---")
-    path1 = downloader._build_local_path("item01", "pdf", "http://example.com/some/path/documento%20final.pdf?query=1")
-    test_logger.info(f"Path generado 1: {path1}") # Esperado: .../pdfs/item01/documentofinal.pdf
-    assert "documentofinal.pdf" in path1
+    example_logger.info(f"Attempting to download PDF for item {test_item_id_pdf} from {test_pdf_url}")
+    success_pdf, path_pdf, md5_pdf, size_pdf = downloader.download_resource(test_item_id_pdf, test_pdf_url, FILE_TYPE_PDF)
 
-    path2 = downloader._build_local_path("item02", "html_snapshot", "http://example.com/page.html")
-    test_logger.info(f"Path generado 2: {path2}") # Esperado: .../html_snapshot/item02/item02_snapshot.html
-    assert "item02_snapshot.html" in path2
+    if success_pdf:
+        example_logger.info(f"PDF Download successful: Path={path_pdf}, MD5={md5_pdf}, Size={size_pdf}")
+        assert os.path.exists(path_pdf), "Downloaded PDF file does not exist where expected."
+        # Test redownload (should skip or be forced based on logic)
+        example_logger.info("Attempting to download the same PDF again (should be skipped or logged as existing)...")
+        s2, p2, m2, sz2 = downloader.download_resource(test_item_id_pdf, test_pdf_url, FILE_TYPE_PDF)
+        assert s2 and p2 == path_pdf, "Second download attempt (skip existing) failed or path changed."
+    else:
+        example_logger.error(f"PDF Download failed for {test_pdf_url}")
 
-    path3 = downloader._build_local_path("item03", "pdf", "http://example.com/very_long_name_with_special_ chars!@#$.pdf")
-    test_logger.info(f"Path generado 3: {path3}") 
-    assert "very_long_name_with_special_chars.pdf" in path3.lower() # La limpieza puede afectar mayúsculas
+    # Test HTML snapshot download
+    test_html_url = "http://example.com" # A simple, stable HTML page
+    test_item_id_html = 202
+    example_logger.info(f"Attempting to download HTML snapshot for item {test_item_id_html} from {test_html_url}")
+    # Using get_html_content for snapshot saving as per its design
+    # html_text_content = downloader.get_html_content(test_html_url, item_id_for_snapshot=test_item_id_html, save_snapshot=True)
+    # if html_text_content:
+    #    example_logger.info(f"HTML content fetched (and snapshot saved if configured).")
+    #    # Path would be built by _get_local_file_path internally by get_html_content if save_snapshot was true
+    #    # constructed_html_path = downloader._get_local_file_path(test_item_id_html, test_html_url, FILE_TYPE_HTML_SNAPSHOT)
+    #    # assert os.path.exists(constructed_html_path), "Saved HTML snapshot does not exist."
+    # else:
+    #    example_logger.error(f"HTML Snapshot fetch failed for {test_html_url}")
+    # The `download_resource` method is more for primary downloads logged to files table.
+    # If an HTML snapshot is a primary artifact to be tracked like a PDF:
+    success_html, path_html, md5_html, size_html = downloader.download_resource(test_item_id_html, test_html_url, FILE_TYPE_HTML_SNAPSHOT)
+    if success_html:
+        example_logger.info(f"HTML Snapshot download successful (via download_resource): Path={path_html}, MD5={md5_html}, Size={size_html}")
+        assert os.path.exists(path_html), "Downloaded HTML file does not exist where expected."
+    else:
+        example_logger.error(f"HTML Snapshot download failed for {test_html_url} (via download_resource)")
 
-    path4 = downloader._build_local_path("item04", "pdf", "http://example.com/") # Sin nombre de archivo
-    test_logger.info(f"Path generado 4: {path4}") 
-    assert path4.endswith(".pdf") # Debería generar un nombre con extensión pdf
-
-    test_logger.info("Pruebas de ResourceDownloaderBR finalizadas.") 
+    example_logger.info("ResourceDownloaderBR example finished.")
+    example_logger.info(f"Please check the '{mock_config_data['base_output_directory']}' directory for output.")
+    pass
