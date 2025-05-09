@@ -49,11 +49,11 @@ DEFAULT_CONFIG_BR = {
     "download_base_retry_delay": 5, 
     "delay": 0.1, 
     "oai_request_delay": 2, # Segundos de espera entre peticiones OAI
-    "max_oai_records_alice": 20, # Límite para prueba OAI Alice
-    "max_oai_records_infoteca": 20, # Límite para prueba OAI Infoteca
-    "max_html_processing_items": 20,
-    "max_pdf_link_extraction_items": 20, 
-    "max_pdf_download_items": 20, 
+    "max_oai_records_alice": 2, # Límite para prueba OAI Alice
+    "max_oai_records_infoteca-e": 2, # Límite para prueba OAI Infoteca - CLAVE CORREGIDA
+    "max_html_processing_items": 2,
+    "max_pdf_link_extraction_items": 2, 
+    "max_pdf_download_items": 2, 
     "download_batch_size": 5, # Aumentado ligeramente
     "output_state_file": "BR/output/state_br.json",
     "output_test_results_file": "BR/output/test_results_br.json",
@@ -61,8 +61,8 @@ DEFAULT_CONFIG_BR = {
     "log_level": "INFO", 
     "timeout_seconds": 60,
     "keyword_search_keywords": ["maiz"], # Mantener o comentar según preferencia
-    "keyword_max_pages": 3, 
-    "keyword_search_items_per_page": 10, 
+    "keyword_max_pages": 1, 
+    "keyword_search_items_per_page": 2, 
     "keyword_search_order_by": "relevancia-ordenacao",
     "keyword_search_direction": "asc",
     "concurrency_level": 5,
@@ -70,8 +70,10 @@ DEFAULT_CONFIG_BR = {
     "selenium_wait_timeout": 60, 
     "generate_state_json": True,
     "generate_test_results_json": True,
-    "test_results_sample_size": 5, 
+    "test_results_sample_size": 1, 
     "chromedriver_path": None,
+    "run_oai_harvest": False, # Nuevo flag para controlar la cosecha OAI
+    "run_keyword_search": True # Nuevo flag para controlar la búsqueda por palabra clave
 }
 
 class ScraperBR:
@@ -178,10 +180,11 @@ class ScraperBR:
         """Procesa ítems para extraer el enlace directo al PDF desde sus páginas HTML."""
         self.logger.info("Iniciando proceso de extracción de enlaces PDF de páginas de ítems...")
         # Estado que indica que los metadatos OAI fueron obtenidos y necesitamos el enlace al PDF
-        items_pending_pdf_link = self.db_manager.get_items_to_process(statuses=['pending_download'], limit=max_items_to_process)
+        # o que el procesamiento HTML fue completado y ahora se busca el PDF.
+        items_pending_pdf_link = self.db_manager.get_items_to_process(statuses=['pending_download', 'pending_pdf_link'], limit=max_items_to_process)
 
         if not items_pending_pdf_link:
-            self.logger.info("No hay ítems pendientes de extracción de enlace PDF.")
+            self.logger.info("No hay ítems pendientes de extracción de enlace PDF (estados 'pending_download' o 'pending_pdf_link').")
             return
 
         self.logger.info(f"Se procesarán {len(items_pending_pdf_link)} ítems para extracción de enlace PDF.")
@@ -477,7 +480,7 @@ class ScraperBR:
 
     def _process_items_for_html_metadata(self):
         """Procesa ítems pendientes de extracción de metadatos desde HTML."""
-        limit = self.config.get('max_items_to_process_html')
+        limit = self.config.get('max_html_processing_items')
         items = self.db_manager.get_items_to_process(statuses=['pending_html_processing'], limit=limit)
         self.logger.info(f"Iniciando procesamiento HTML para {len(items)} ítems (límite: {limit}). Estado buscado: pending_html_processing")
 
@@ -501,7 +504,7 @@ class ScraperBR:
             if html_content:
                 self.logger.debug(f"Snapshot HTML obtenido para item ID {item_id}, guardado en: {html_local_path}")
                 try:
-                    metadata = self.html_extractor.extract_metadata(html_content, item_page_url)
+                    metadata = self.html_extractor.extract_all_metadata(item_page_url, item_id_for_log=item_id)
                     self.logger.info(f"Metadatos extraídos para item ID {item_id}. Título: {metadata.get('title', 'N/A')}")
                     
                     # Combinar metadatos existentes (si los hay) con los nuevos
@@ -560,12 +563,13 @@ class ScraperBR:
         try:
             # --- Fase 1: Descubrimiento / Registro --- 
             # Ejecutar OAI PRIMERO si está activado
-            run_oai = False
-            for repo_key in self.config.get('repositories', {}):
-                 if self.config.get(f'max_oai_records_{repo_key}', 0) > 0:
-                      run_oai = True
-                      break
-            if run_oai:
+            run_oai_configured = False
+            if self.config.get('run_oai_harvest', True): # Consultar nuevo flag
+                for repo_key in self.config.get('repositories', {}):
+                    if self.config.get(f'max_oai_records_{repo_key}', 0) > 0:
+                        run_oai_configured = True
+                        break
+            if run_oai_configured: # Solo correr si el flag está True Y hay repos OAI configurados con límites > 0
                  oai_harvest_stats = self._run_oai_harvest() 
                  if oai_harvest_stats:
                     overall_stats['oai_total_fetched'] = oai_harvest_stats.get('oai_total_fetched', 0)
@@ -575,15 +579,15 @@ class ScraperBR:
                     overall_stats['oai_total_harvest_failures'] = oai_harvest_stats.get('oai_total_harvest_failures', 0)
                     overall_stats['oai_repositories_processed_count'] = oai_harvest_stats.get('oai_repositories_processed_count', 0)
             else:
-                 self.logger.info("Cosecha OAI desactivada en configuración. Saltando.")
+                 self.logger.info("Cosecha OAI desactivada (por flag 'run_oai_harvest' o sin repositorios/límites OAI configurados). Saltando.")
 
             # Ejecutar Keyword Search DESPUÉS o si OAI está desactivado
-            if self.config.get('keyword_search_keywords'):
+            if self.config.get('run_keyword_search', True) and self.config.get('keyword_search_keywords'): # Consultar nuevo flag
                  keyword_stats = self._run_keyword_search()
                  if keyword_stats:
                     overall_stats['keyword_new_items_found'] = keyword_stats.get('keyword_new_items_found', 0)
             else:
-                 self.logger.info("No hay keywords configuradas, saltando búsqueda por keyword.")
+                 self.logger.info("Búsqueda por palabra clave desactivada (por flag 'run_keyword_search' o sin keywords configuradas). Saltando.")
             
             # --- Fase 2: Procesamiento HTML y Metadatos --- 
             html_processed_count = self._process_items_for_html_metadata()
@@ -643,10 +647,10 @@ if __name__ == '__main__':
     if args.harvest_all:
         # Activar OAI si se pide (ajustar límites si se implementa OAI)
         config_to_use['max_oai_records_alice'] = config_to_use.get('max_oai_records_alice', 100) if config_to_use.get('max_oai_records_alice', 0) == 0 else config_to_use.get('max_oai_records_alice') # Ejemplo de activación
-        config_to_use['max_oai_records_infoteca'] = config_to_use.get('max_oai_records_infoteca', 100) if config_to_use.get('max_oai_records_infoteca', 0) == 0 else config_to_use.get('max_oai_records_infoteca')
+        config_to_use['max_oai_records_infoteca-e'] = config_to_use.get('max_oai_records_infoteca-e', 100) if config_to_use.get('max_oai_records_infoteca-e', 0) == 0 else config_to_use.get('max_oai_records_infoteca-e')
     if args.max_items is not None:
         # Aplicar max_items a los límites relevantes
-        config_to_use['max_items_to_process_html'] = min(config_to_use.get('max_items_to_process_html', 10), args.max_items)
+        config_to_use['max_html_processing_items'] = min(config_to_use.get('max_html_processing_items', 10), args.max_items)
         config_to_use['max_pdf_link_extraction_items'] = min(config_to_use.get('max_pdf_link_extraction_items', 10), args.max_items)
         config_to_use['max_pdf_download_items'] = min(config_to_use.get('max_pdf_download_items', 10), args.max_items)
         # Considerar si max_items debe limitar también OAI o keyword pages/items
